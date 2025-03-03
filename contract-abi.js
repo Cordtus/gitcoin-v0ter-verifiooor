@@ -3,7 +3,7 @@
  */
 
 // Proxy contract ABI
-const PROXY_ABI = [
+export const PROXY_ABI = [
     {
         "inputs": [
             {
@@ -82,7 +82,7 @@ const PROXY_ABI = [
 
 // Based on the implementation's deployed bytecode, we can identify these function signatures
 // This is a partial ABI since we don't have the full ABI provided
-const IMPLEMENTATION_ABI = [
+export const IMPLEMENTATION_ABI = [
     {
         "inputs": [],
         "name": "owner",
@@ -114,8 +114,3 @@ const IMPLEMENTATION_ABI = [
         "type": "receive"
     }
 ];
-
-module.exports = {
-    PROXY_ABI,
-    IMPLEMENTATION_ABI
-};

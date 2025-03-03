@@ -1,6 +1,6 @@
-const axios = require('axios');
-const { fetchLogs } = require('sei-logs-wrapper');
-const { ethers } = require('ethers');
+import axios from 'axios';
+import { fetchLogs } from 'sei-logs-wrapper';
+import { ethers } from 'ethers';
 
 /**
  * Makes an API request with fallback support
@@ -269,7 +269,7 @@ async function getTransactionReceipt(txHash, primaryRpc, fallbackRpc) {
     }
 }
 
-module.exports = {
+export {
     estimateBlockHeight,
     getCurrentBlockHeight,
     getBlockByNumber,

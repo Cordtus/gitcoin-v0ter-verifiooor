@@ -1,7 +1,12 @@
-const contractReader = require('./contractReader');
-const walletBalances = require('./walletBalances');
-const fs = require('fs');
-const path = require('path');
+import * as contractReader from './contractReader.js';
+import * as walletBalances from './walletBalances.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Get directory name in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Configuration
 const PROXY_ADDRESS = '0x1E18cdce56B3754c4Dca34CB3a7439C24E8363de'.toLowerCase();
@@ -243,11 +248,11 @@ async function schedulePeriodicChecks() {
 }
 
 // Start the monitoring if this file is executed directly
-if (require.main === module) {
+if (import.meta.url === `file://${process.argv[1]}`) {
     schedulePeriodicChecks();
 }
 
-module.exports = {
+export {
     trackVotingActivity,
     schedulePeriodicChecks
 };

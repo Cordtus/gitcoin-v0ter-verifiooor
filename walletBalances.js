@@ -1,5 +1,5 @@
-const axios = require('axios');
-const fs = require('fs');
+import axios from 'axios';
+import fs from 'fs';
 
 // Constants
 const USEI_TO_SEI = 1000000; // 1 SEI = 1,000,000 uSEI
@@ -94,6 +94,7 @@ async function getSeiBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbac
         
         // If the response has balance data
         if (response.data && response.data.balance && response.data.balance.amount) {
+            // The amount will be in "usei" format (e.g., "100000000usei" for 100 SEI)
             const uSeiAmount = parseInt(response.data.balance.amount);
             const seiAmount = uSeiAmount / USEI_TO_SEI;
             
@@ -318,118 +319,3 @@ async function checkFinalBalances(
     
     console.log('Final balance check complete.');
 }
-
-/**
- * Generate a comprehensive report
- * @param {string} walletsFile Wallets file path
- * @param {string} votesFile Votes file path
- * @param {number} minSeiRequired Minimum SEI required
- * @param {string} votingReportFile Voting report file path
- * @param {string} walletReportFile Wallet report file path
- */
-async function generateReport(walletsFile, votesFile, minSeiRequired, votingReportFile, walletReportFile) {
-    // Load data
-    const wallets = loadWalletData(walletsFile);
-    const votes = loadVotingData(votesFile);
-    
-    // Calculate statistics
-    let totalVotes = votes.size;
-    let initialValidVotes = 0;
-    let finalValidVotes = 0;
-    let uniqueWallets = wallets.size;
-    let walletsWithValidVotes = 0;
-    
-    for (const vote of votes.values()) {
-        if (vote.isValid) initialValidVotes++;
-        if (vote.finalIsValid) finalValidVotes++;
-    }
-    
-    for (const wallet of wallets.values()) {
-        if (wallet.votes.some(txHash => {
-            const vote = votes.get(txHash);
-            return vote && vote.finalIsValid;
-        })) {
-            walletsWithValidVotes++;
-        }
-    }
-    
-    // Generate console report
-    console.log('\n===== VOTING REPORT =====');
-    console.log(`Total votes: ${totalVotes}`);
-    console.log(`Initially valid votes: ${initialValidVotes}`);
-    console.log(`Final valid votes: ${finalValidVotes}`);
-    console.log(`Unique wallets: ${uniqueWallets}`);
-    console.log(`Wallets with valid votes: ${walletsWithValidVotes}`);
-    
-    // Generate invalid votes report
-    console.log('\n===== INVALID VOTES =====');
-    for (const vote of votes.values()) {
-        if (!vote.finalIsValid) {
-            console.log(`${vote.txHash} from ${vote.evmAddress} (${vote.cosmosAddress}):`);
-            console.log(`  Balance at vote: ${vote.balanceAtVote} SEI`);
-            console.log(`  Balance before vote: ${vote.balanceBeforeVote} SEI`);
-            
-            // Get the wallet to check final balance
-            const wallet = wallets.get(vote.evmAddress);
-            console.log(`  Final balance: ${wallet.finalBalance} SEI`);
-            
-            // Reason for invalidity
-            if (vote.balanceAtVote < minSeiRequired || vote.balanceBeforeVote < minSeiRequired) {
-                console.log(`  Reason: Insufficient balance at time of voting`);
-            } else if (!wallet.finalBalanceValid) {
-                console.log(`  Reason: Insufficient balance at end of voting period`);
-            }
-            console.log('-----------------------------------');
-        }
-    }
-    
-    // Generate CSV report for votes
-    const voteCsvHeader = 'TxHash,VoterEvm,VoterCosmos,BlockHeight,Timestamp,BalanceAtVote,BalanceBeforeVote,InitialValid,FinalValid\n';
-    let voteCsvContent = voteCsvHeader;
-    
-    for (const vote of votes.values()) {
-        voteCsvContent += `${vote.txHash},${vote.evmAddress},${vote.cosmosAddress},${vote.blockHeight},${vote.timestamp},${vote.balanceAtVote},${vote.balanceBeforeVote},${vote.isValid},${vote.finalIsValid}\n`;
-    }
-    
-    try {
-        fs.writeFileSync(votingReportFile, voteCsvContent, 'utf8');
-        console.log(`\nVoting report saved to ${votingReportFile}`);
-    } catch (error) {
-        console.error(`Error saving voting report: ${error.message}`);
-    }
-    
-    // Generate CSV report for wallets
-    const walletCsvHeader = 'EvmAddress,CosmosAddress,VoteCount,ValidVoteCount,FinalBalance,MeetsRequirement\n';
-    let walletCsvContent = walletCsvHeader;
-    
-    for (const wallet of wallets.values()) {
-        const voteCount = wallet.votes.length;
-        const validVoteCount = wallet.votes.filter(txHash => {
-            const vote = votes.get(txHash);
-            return vote && vote.finalIsValid;
-        }).length;
-        
-        walletCsvContent += `${wallet.evmAddress},${wallet.cosmosAddress},${voteCount},${validVoteCount},${wallet.finalBalance},${wallet.finalBalanceValid}\n`;
-    }
-    
-    try {
-        fs.writeFileSync(walletReportFile, walletCsvContent, 'utf8');
-        console.log(`Wallet report saved to ${walletReportFile}`);
-    } catch (error) {
-        console.error(`Error saving wallet report: ${error.message}`);
-    }
-    
-    console.log('========================\n');
-}
-
-module.exports = {
-    convertEvmToCosmos,
-    getSeiBalance,
-    recordVote,
-    checkFinalBalances,
-    generateReport,
-    loadWalletData,
-    saveWalletData,
-    loadVotingData,
-    saveVotingData
-};
