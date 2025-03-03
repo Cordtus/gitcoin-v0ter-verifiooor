@@ -156,8 +156,8 @@ async function getBlockByNumber(blockNumber, primaryRpc, fallbackRpc) {
  */
 async function fetchVotingEvents(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc) {
     const filter = {
-        fromBlock: `0x${fromBlock.toString(16)}`,
-        toBlock: `0x${toBlock.toString(16)}`,
+        fromBlock: fromBlock,  // sei-logs-wrapper handles conversion
+        toBlock: toBlock,      // sei-logs-wrapper handles conversion
         address: addresses
     };
     

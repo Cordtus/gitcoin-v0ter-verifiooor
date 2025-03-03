@@ -1,5 +1,6 @@
 import * as contractReader from './contractReader.js';
 import * as walletBalances from './walletBalances.js';
+import { findStartBlock } from './findStartBlock.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -82,12 +83,16 @@ async function trackVotingActivity() {
         // Get starting block
         let fromBlock = loadLastProcessedBlock();
         if (fromBlock === 0) {
-            fromBlock = await contractReader.estimateBlockHeight(
-                VOTING_START_DATE, 
-                RPC_ENDPOINTS.primary.evmRpc, 
+            // Find the exact block at the start of voting period
+            fromBlock = await findStartBlock(
+                VOTING_START_DATE,
+                RPC_ENDPOINTS.primary.evmRpc,
                 RPC_ENDPOINTS.archive.evmRpc
             );
-            console.log(`Starting from estimated block: ${fromBlock}`);
+            console.log(`Found exact starting block: ${fromBlock}`);
+            
+            // Save this block as the starting point
+            saveLastProcessedBlock(fromBlock);
         }
 
         // Get current block
@@ -97,101 +102,83 @@ async function trackVotingActivity() {
         );
         console.log(`Current block: ${currentBlock}`);
 
-        // Process blocks in batches
-        const BATCH_SIZE = 2000; // RPC standard limit
-        let processedBlock = fromBlock;
-
-        while (processedBlock < currentBlock) {
-            const toBlock = Math.min(processedBlock + BATCH_SIZE - 1, currentBlock);
+        // Fetch all logs in one request using the wrapper, which handles pagination internally
+        try {
+            // Fetch voting events for the entire range
+            const events = await contractReader.fetchVotingEvents(
+                fromBlock, 
+                currentBlock, 
+                [PROXY_ADDRESS, IMPLEMENTATION_ADDRESS],
+                RPC_ENDPOINTS.primary.evmRpc,
+                RPC_ENDPOINTS.archive.evmRpc
+            );
             
-            try {
-                // Fetch voting events
-                const events = await contractReader.fetchVotingEvents(
-                    processedBlock, 
-                    toBlock, 
-                    [PROXY_ADDRESS, IMPLEMENTATION_ADDRESS],
+            console.log(`Found ${events.length} events between blocks ${fromBlock} and ${currentBlock}`);
+            
+            // Process each event to find votes
+            for (const event of events) {
+                const txDetails = await contractReader.getTransactionDetails(
+                    event.transactionHash,
                     RPC_ENDPOINTS.primary.evmRpc,
                     RPC_ENDPOINTS.archive.evmRpc
                 );
                 
-                console.log(`Found ${events.length} events between blocks ${processedBlock} and ${toBlock}`);
+                // Skip if transaction failed or is not a vote
+                if (!txDetails || !txDetails.success || !txDetails.isVotingTransaction) {
+                    continue;
+                }
                 
-                // Process each event to find votes
-                for (const event of events) {
-                    const txDetails = await contractReader.getTransactionDetails(
-                        event.transactionHash,
-                        RPC_ENDPOINTS.primary.evmRpc,
-                        RPC_ENDPOINTS.archive.evmRpc
+                // Get wallet balance at vote time and before
+                try {
+                    // Convert EVM address to Cosmos address
+                    const cosmosAddress = await walletBalances.convertEvmToCosmos(
+                        txDetails.from,
+                        RPC_ENDPOINTS.primary.rest,
+                        RPC_ENDPOINTS.archive.rest
                     );
                     
-                    // Skip if transaction failed or is not a vote
-                    if (!txDetails || !txDetails.success || !txDetails.isVotingTransaction) {
-                        continue;
-                    }
+                    // Check balance at vote and one block before
+                    const balanceAtVote = await walletBalances.getSeiBalance(
+                        cosmosAddress, 
+                        txDetails.blockNumber,
+                        RPC_ENDPOINTS.primary.rest,
+                        RPC_ENDPOINTS.archive.rest
+                    );
                     
-                    // Get wallet balance at vote time and before
-                    try {
-                        // Convert EVM address to Cosmos address
-                        const cosmosAddress = await walletBalances.convertEvmToCosmos(
-                            txDetails.from,
-                            RPC_ENDPOINTS.primary.rest,
-                            RPC_ENDPOINTS.archive.rest
-                        );
-                        
-                        // Check balance at vote and one block before
-                        const balanceAtVote = await walletBalances.getSeiBalance(
-                            cosmosAddress, 
-                            txDetails.blockNumber,
-                            RPC_ENDPOINTS.primary.rest,
-                            RPC_ENDPOINTS.archive.rest
-                        );
-                        
-                        const balanceBeforeVote = await walletBalances.getSeiBalance(
-                            cosmosAddress, 
-                            txDetails.blockNumber - 1,
-                            RPC_ENDPOINTS.primary.rest,
-                            RPC_ENDPOINTS.archive.rest
-                        );
-                        
-                        // Record vote information
-                        await walletBalances.recordVote(
-                            txDetails.hash,
-                            txDetails.from,
-                            cosmosAddress,
-                            txDetails.blockNumber,
-                            txDetails.timestamp,
-                            balanceAtVote,
-                            balanceBeforeVote,
-                            MIN_SEI_REQUIRED,
-                            WALLETS_FILE,
-                            VOTES_FILE
-                        );
-                        
-                        console.log(`Processed vote: ${txDetails.hash} from ${txDetails.from}`);
-                        console.log(`  Balance at vote: ${balanceAtVote} SEI`);
-                        console.log(`  Balance before vote: ${balanceBeforeVote} SEI`);
-                    } catch (error) {
-                        console.error(`Error processing vote ${txDetails.hash}:`, error.message);
-                    }
+                    const balanceBeforeVote = await walletBalances.getSeiBalance(
+                        cosmosAddress, 
+                        txDetails.blockNumber - 1,
+                        RPC_ENDPOINTS.primary.rest,
+                        RPC_ENDPOINTS.archive.rest
+                    );
+                    
+                    // Record vote information
+                    await walletBalances.recordVote(
+                        txDetails.hash,
+                        txDetails.from,
+                        cosmosAddress,
+                        txDetails.blockNumber,
+                        txDetails.timestamp,
+                        balanceAtVote,
+                        balanceBeforeVote,
+                        MIN_SEI_REQUIRED,
+                        WALLETS_FILE,
+                        VOTES_FILE
+                    );
+                    
+                    console.log(`Processed vote: ${txDetails.hash} from ${txDetails.from}`);
+                    console.log(`  Balance at vote: ${balanceAtVote} SEI`);
+                    console.log(`  Balance before vote: ${balanceBeforeVote} SEI`);
+                } catch (error) {
+                    console.error(`Error processing vote ${txDetails.hash}:`, error.message);
                 }
-                
-                // Update last processed block
-                processedBlock = toBlock + 1;
-                saveLastProcessedBlock(processedBlock);
-            } catch (error) {
-                console.error(`Error processing blocks ${processedBlock} to ${toBlock}:`, error.message);
-                // Reduce batch size on failure and retry
-                const reducedBatchSize = Math.floor(BATCH_SIZE / 2);
-                if (reducedBatchSize >= 100) {
-                    console.log(`Reducing batch size to ${reducedBatchSize} and retrying...`);
-                    processedBlock += reducedBatchSize;
-                } else {
-                    // If we can't reduce anymore, skip this problematic range
-                    console.log(`Skipping problematic block range, moving to ${toBlock + 1}`);
-                    processedBlock = toBlock + 1;
-                }
-                saveLastProcessedBlock(processedBlock);
             }
+            
+            // Update last processed block
+            saveLastProcessedBlock(currentBlock);
+        } catch (error) {
+            console.error(`Error processing blocks ${fromBlock} to ${currentBlock}:`, error.message);
+            return false;
         }
 
         // Check if voting period is over
