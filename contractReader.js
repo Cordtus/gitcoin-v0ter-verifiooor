@@ -1,102 +1,7 @@
-import axios from 'axios';
-import { fetchLogs } from 'sei-logs-wrapper';
+// contractReader.js
+
 import { ethers } from 'ethers';
-
-/**
- * Makes an API request with fallback support
- * @param {Object} options Request options
- * @param {string} primaryUrl Primary API URL
- * @param {string} fallbackUrl Fallback API URL
- * @returns {Promise<Object>} API response
- */
-async function makeRequestWithFallback(options, primaryUrl, fallbackUrl) {
-    try {
-        const response = await axios({
-            ...options,
-            url: primaryUrl
-        });
-        return response;
-    } catch (error) {
-        console.log(`Request to primary endpoint failed: ${error.message}`);
-        console.log(`Trying fallback endpoint: ${fallbackUrl}`);
-        
-        try {
-            const response = await axios({
-                ...options,
-                url: fallbackUrl
-            });
-            return response;
-        } catch (fallbackError) {
-            console.error(`Fallback request also failed: ${fallbackError.message}`);
-            throw fallbackError;
-        }
-    }
-}
-
-/**
- * Makes a JSON-RPC request with fallback support
- * @param {string} method RPC method
- * @param {Array} params RPC parameters
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<any>} RPC response
- */
-async function rpcRequestWithFallback(method, params, primaryRpc, fallbackRpc) {
-    const options = {
-        method: 'POST',
-        data: {
-            jsonrpc: '2.0',
-            id: 1,
-            method,
-            params
-        },
-        headers: {
-            'Content-Type': 'application/json'
-        }
-    };
-    
-    const response = await makeRequestWithFallback(options, primaryRpc, fallbackRpc);
-    return response.data.result;
-}
-
-/**
- * Estimate block height for a given date
- * @param {Date} date Target date
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<number>} Estimated block height
- */
-async function estimateBlockHeight(date, primaryRpc, fallbackRpc) {
-    try {
-        // Get current block info
-        const currentBlockHex = await rpcRequestWithFallback(
-            'eth_blockNumber', 
-            [], 
-            primaryRpc, 
-            fallbackRpc
-        );
-        
-        const currentBlock = parseInt(currentBlockHex, 16);
-        
-        // Current timestamp
-        const now = new Date();
-        
-        // SEI block time is approximately 400ms
-        const BLOCK_TIME_MS = 400;
-        
-        // Calculate time difference in milliseconds
-        const timeDiffMs = date.getTime() - now.getTime();
-        
-        // Estimate block difference
-        const blockDiff = Math.floor(timeDiffMs / BLOCK_TIME_MS);
-        
-        // Calculate target block
-        return Math.max(0, currentBlock + blockDiff); // Ensure we don't go below 0
-    } catch (error) {
-        console.error('Error estimating block height:', error.message);
-        throw error;
-    }
-}
+import axios from 'axios';
 
 /**
  * Get current block height
@@ -104,141 +9,252 @@ async function estimateBlockHeight(date, primaryRpc, fallbackRpc) {
  * @param {string} fallbackRpc Fallback RPC endpoint
  * @returns {Promise<number>} Current block height
  */
-async function getCurrentBlockHeight(primaryRpc, fallbackRpc) {
+export async function getCurrentBlockHeight(primaryRpc, fallbackRpc) {
     try {
-        const currentBlockHex = await rpcRequestWithFallback(
-            'eth_blockNumber',
-            [],
-            primaryRpc,
-            fallbackRpc
-        );
-        
-        return parseInt(currentBlockHex, 16);
+        const provider = new ethers.JsonRpcProvider(primaryRpc);
+        return await provider.getBlockNumber();
     } catch (error) {
-        console.error('Error getting current block height:', error.message);
-        throw error;
+        console.error('Primary RPC failed, trying fallback:', error.message);
+        const provider = new ethers.JsonRpcProvider(fallbackRpc);
+        return await provider.getBlockNumber();
     }
 }
 
 /**
- * Get block details by number
- * @param {number} blockNumber Block number
+ * Fetch voting events using best available method
+ * @param {number} fromBlock Starting block
+ * @param {number} toBlock Ending block
+ * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Object>} Block details
+ * @returns {Promise<Array>} Array of voting events
  */
-async function getBlockByNumber(blockNumber, primaryRpc, fallbackRpc) {
+export async function fetchVotingEvents(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc) {
+    console.log(`Fetching voting transactions from block ${fromBlock} to ${toBlock}`);
+    
+    // Try trace_filter first (most efficient)
     try {
-        const blockHex = `0x${blockNumber.toString(16)}`;
-        
-        const block = await rpcRequestWithFallback(
-            'eth_getBlockByNumber',
-            [blockHex, false],
-            primaryRpc,
-            fallbackRpc
-        );
-        
-        return block;
+        return await fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc);
     } catch (error) {
-        console.error(`Error getting block ${blockNumber}:`, error.message);
-        throw error;
+        console.log(`trace_filter failed: ${error.message}`);
+        console.log('Falling back to block scanning method');
+        return await fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc);
     }
 }
 
 /**
- * Fetch voting events from logs with fallback
- * @param {number} fromBlock Start block
- * @param {number} toBlock End block
- * @param {Array<string>} addresses Contract addresses to monitor
+ * Fetch voting events using trace_filter
+ * @param {number} fromBlock Starting block
+ * @param {number} toBlock Ending block
+ * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Array>} Event logs
+ * @returns {Promise<Array>} Array of voting events
  */
-async function fetchVotingEvents(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc) {
-    const filter = {
-        fromBlock: fromBlock,  // sei-logs-wrapper handles conversion
-        toBlock: toBlock,      // sei-logs-wrapper handles conversion
-        address: addresses
+async function fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc) {
+    const proxyAddress = ethers.getAddress(addresses[0].toLowerCase());
+    const implAddress = ethers.getAddress(addresses[1].toLowerCase());
+    
+    const traceFilterPayload = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "trace_filter",
+        params: [{
+            fromBlock: `0x${fromBlock.toString(16)}`,
+            toBlock: `0x${toBlock.toString(16)}`,
+            fromAddress: [proxyAddress],
+            toAddress: [implAddress],
+            after: 0,
+            count: 10000
+        }]
     };
     
+    let response, rpcUrl;
+    
     try {
-        console.log(`Fetching logs from block ${fromBlock} to ${toBlock}...`);
-        
-        try {
-            // Try primary node first
-            const logs = await fetchLogs(filter, primaryRpc, 'eth_getLogs');
-            console.log(`Found ${logs.length} logs using primary node`);
-            return logs;
-        } catch (primaryError) {
-            console.log(`Primary node failed: ${primaryError.message}`);
-            console.log('Trying archive node...');
-            
-            // If primary fails, use archive node
-            const logs = await fetchLogs(filter, fallbackRpc, 'eth_getLogs');
-            console.log(`Found ${logs.length} logs using archive node`);
-            return logs;
-        }
+        // Try primary RPC first
+        rpcUrl = primaryRpc;
+        response = await axios.post(primaryRpc, traceFilterPayload);
     } catch (error) {
-        console.error('Error fetching logs from both nodes:', error.message);
-        throw error;
+        console.log(`Primary RPC failed: ${error.message}`);
+        console.log('Trying fallback RPC...');
+        
+        // Try fallback RPC
+        rpcUrl = fallbackRpc;
+        response = await axios.post(fallbackRpc, traceFilterPayload);
     }
+    
+    if (response.data.error) {
+        throw new Error(`RPC error: ${response.data.error.message}`);
+    }
+    
+    // Process and return results
+    const traces = response.data.result;
+    console.log(`Found ${traces.length} voting transactions with trace_filter`);
+    
+    // Get provider for block and transaction details
+    const provider = new ethers.JsonRpcProvider(rpcUrl);
+    
+    // Process traces in batches to avoid overwhelming the provider
+    const BATCH_SIZE = 20;
+    let results = [];
+    
+    for (let i = 0; i < traces.length; i += BATCH_SIZE) {
+        const batch = traces.slice(i, i + BATCH_SIZE);
+        const batchPromises = batch.map(async (trace) => {
+            try {
+                const blockNumber = parseInt(trace.blockNumber, 16);
+                
+                // Get transaction to find original sender
+                const tx = await provider.getTransaction(trace.transactionHash);
+                // Get block for timestamp
+                const block = await provider.getBlock(blockNumber);
+                
+                if (!tx || !block) return null;
+                
+                return {
+                    transactionHash: trace.transactionHash,
+                    blockNumber: blockNumber,
+                    from: tx.from, // Original sender of the transaction
+                    to: tx.to, // The proxy address
+                    value: parseInt(trace.action.value, 16), // Value in wei
+                    timestamp: new Date(Number(block.timestamp) * 1000),
+                    success: true,
+                    isVotingTransaction: true
+                };
+            } catch (error) {
+                console.error(`Error processing trace ${trace.transactionHash}:`, error.message);
+                return null;
+            }
+        });
+        
+        const batchResults = await Promise.all(batchPromises);
+        results = results.concat(batchResults.filter(r => r !== null));
+    }
+    
+    return results;
 }
 
 /**
- * Get transaction details with fallback
+ * Fallback method if trace_filter isn't available
+ * @param {number} fromBlock Starting block
+ * @param {number} toBlock Ending block
+ * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
+ * @param {string} primaryRpc Primary RPC endpoint
+ * @param {string} fallbackRpc Fallback RPC endpoint
+ * @returns {Promise<Array>} Array of voting events
+ */
+async function fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc) {
+    const proxyAddress = ethers.getAddress(addresses[0].toLowerCase());
+    const results = [];
+    
+    let provider;
+    try {
+        provider = new ethers.JsonRpcProvider(primaryRpc);
+    } catch (error) {
+        console.log(`Primary RPC failed: ${error.message}`);
+        provider = new ethers.JsonRpcProvider(fallbackRpc);
+    }
+    
+    // Process in batches to avoid overwhelming the node
+    const BATCH_SIZE = 100;
+    
+    for (let currentBlock = fromBlock; currentBlock <= toBlock; currentBlock += BATCH_SIZE) {
+        const endBlock = Math.min(currentBlock + BATCH_SIZE - 1, toBlock);
+        console.log(`Scanning blocks ${currentBlock} to ${endBlock}`);
+        
+        for (let blockNum = currentBlock; blockNum <= endBlock; blockNum++) {
+            try {
+                // Get block with transactions
+                const block = await provider.getBlock(blockNum, true);
+                
+                if (!block || !block.transactions) continue;
+                
+                // Filter transactions to the proxy with value > 0
+                for (const txHash of block.transactions) {
+                    try {
+                        const tx = await provider.getTransaction(txHash);
+                        
+                        // Skip if not a transaction to proxy or has no value
+                        if (!tx || !tx.to || 
+                            tx.to.toLowerCase() !== proxyAddress.toLowerCase() || 
+                            tx.value === 0n) {
+                            continue;
+                        }
+                        
+                        // Check if transaction was successful
+                        const receipt = await provider.getTransactionReceipt(txHash);
+                        
+                        if (receipt && receipt.status) {
+                            results.push({
+                                transactionHash: tx.hash,
+                                blockNumber: blockNum,
+                                from: tx.from,
+                                to: tx.to,
+                                value: Number(tx.value), // Convert BigInt to Number
+                                timestamp: new Date(Number(block.timestamp) * 1000),
+                                success: true,
+                                isVotingTransaction: true
+                            });
+                        }
+                    } catch (txError) {
+                        console.error(`Error processing tx ${txHash}:`, txError.message);
+                    }
+                }
+            } catch (error) {
+                console.error(`Error processing block ${blockNum}:`, error.message);
+            }
+        }
+    }
+    
+    console.log(`Found ${results.length} voting transactions with block scanning`);
+    return results;
+}
+
+/**
+ * Get transaction details for a specific hash
  * @param {string} txHash Transaction hash
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Object|null>} Transaction details or null
+ * @returns {Promise<Object>} Transaction details
  */
-async function getTransactionDetails(txHash, primaryRpc, fallbackRpc) {
+export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc) {
+    let provider;
+    
     try {
-        // Get transaction
-        const tx = await rpcRequestWithFallback(
-            'eth_getTransactionByHash',
-            [txHash],
-            primaryRpc,
-            fallbackRpc
-        );
-        
+        provider = new ethers.JsonRpcProvider(primaryRpc);
+    } catch (primaryError) {
+        console.log(`Primary RPC failed: ${primaryError.message}`);
+        provider = new ethers.JsonRpcProvider(fallbackRpc);
+    }
+    
+    try {
+        // Get transaction data
+        const tx = await provider.getTransaction(txHash);
         if (!tx) {
-            console.error(`Transaction ${txHash} not found`);
+            console.log(`Transaction ${txHash} not found`);
             return null;
         }
         
-        // Get receipt
-        const receipt = await rpcRequestWithFallback(
-            'eth_getTransactionReceipt',
-            [txHash],
-            primaryRpc,
-            fallbackRpc
-        );
-        
-        if (!receipt || receipt.status !== '0x1') {
-            return null; // Transaction failed
+        // Get receipt for status
+        const receipt = await provider.getTransactionReceipt(txHash);
+        if (!receipt) {
+            console.log(`Receipt for ${txHash} not found`);
+            return null;
         }
         
-        // Get block
-        const block = await getBlockByNumber(
-            parseInt(tx.blockNumber, 16),
-            primaryRpc,
-            fallbackRpc
-        );
-        
-        // Check if this is a voting transaction (has value)
-        const value = ethers.BigNumber.from(tx.value);
-        const isVotingTransaction = !value.isZero();
+        // Get block for timestamp
+        const block = await provider.getBlock(tx.blockNumber);
         
         return {
-            hash: txHash,
-            blockNumber: parseInt(tx.blockNumber, 16),
-            blockHash: tx.blockHash,
-            from: tx.from.toLowerCase(),
-            to: tx.to.toLowerCase(),
-            value: ethers.utils.formatEther(tx.value),
-            timestamp: new Date(parseInt(block.timestamp, 16) * 1000),
-            success: receipt.status === '0x1',
-            isVotingTransaction
+            hash: tx.hash,
+            blockNumber: Number(tx.blockNumber),
+            from: tx.from,
+            to: tx.to,
+            value: Number(tx.value), // Convert BigInt to Number
+            timestamp: new Date(Number(block.timestamp) * 1000),
+            success: receipt.status === 1,
+            isVotingTransaction: tx.to && tx.to.toLowerCase() === addresses[0].toLowerCase() && tx.value > 0n
         };
     } catch (error) {
         console.error(`Error getting transaction details for ${txHash}:`, error.message);
@@ -247,34 +263,46 @@ async function getTransactionDetails(txHash, primaryRpc, fallbackRpc) {
 }
 
 /**
- * Get transaction receipt with fallback
- * @param {string} txHash Transaction hash
+ * Check if the primary node has the block data
+ * @param {number} blockNumber Block to check
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Object|null>} Transaction receipt or null
+ * @returns {Promise<{hasBlock: boolean, useArchive: boolean}>} Result of check
  */
-async function getTransactionReceipt(txHash, primaryRpc, fallbackRpc) {
+export async function checkBlockAvailability(blockNumber, primaryRpc, fallbackRpc) {
     try {
-        const receipt = await rpcRequestWithFallback(
-            'eth_getTransactionReceipt',
-            [txHash],
-            primaryRpc,
-            fallbackRpc
-        );
+        console.log(`Checking if block ${blockNumber} is available on primary node...`);
         
-        return receipt;
+        // Try primary provider
+        try {
+            const provider = new ethers.JsonRpcProvider(primaryRpc);
+            const block = await provider.getBlock(blockNumber);
+            
+            if (block) {
+                console.log(`Block ${blockNumber} is available on primary node`);
+                return { hasBlock: true, useArchive: false };
+            }
+        } catch (error) {
+            console.log(`Primary node failed for block check: ${error.message}`);
+        }
+        
+        // Try archive provider
+        try {
+            const provider = new ethers.JsonRpcProvider(fallbackRpc);
+            const block = await provider.getBlock(blockNumber);
+            
+            if (block) {
+                console.log(`Block ${blockNumber} is available on archive node`);
+                return { hasBlock: true, useArchive: true };
+            }
+        } catch (error) {
+            console.log(`Archive node also failed for block check: ${error.message}`);
+        }
+        
+        console.log(`Block ${blockNumber} not found on either node`);
+        return { hasBlock: false, useArchive: false };
     } catch (error) {
-        console.error(`Error getting transaction receipt for ${txHash}:`, error.message);
-        return null;
+        console.error(`Error checking block availability: ${error.message}`);
+        return { hasBlock: false, useArchive: true }; // Default to archive on error
     }
 }
-
-export {
-    estimateBlockHeight,
-    getCurrentBlockHeight,
-    getBlockByNumber,
-    fetchVotingEvents,
-    getTransactionDetails,
-    getTransactionReceipt,
-    rpcRequestWithFallback
-};

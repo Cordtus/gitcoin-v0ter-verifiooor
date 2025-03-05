@@ -1,4 +1,6 @@
-import axios from 'axios';
+// contractReader.js
+
+import { ethers } from 'ethers';
 
 /**
  * Find the exact block number for a target date
@@ -8,13 +10,21 @@ import axios from 'axios';
  * @returns {Promise<number>} Block number
  */
 export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
+    let provider;
+    try {
+        provider = new ethers.JsonRpcProvider(primaryRpc);
+    } catch (error) {
+        console.log(`Primary RPC failed: ${error.message}`);
+        provider = new ethers.JsonRpcProvider(fallbackRpc);
+    }
+    
     try {
         console.log(`Finding exact block for date: ${targetDate.toISOString()}`);
         
         // Get current block and its timestamp
-        const currentBlock = await getCurrentBlock(primaryRpc, fallbackRpc);
-        const currentBlockData = await getBlockByNumber(currentBlock, primaryRpc, fallbackRpc);
-        const currentTimestamp = new Date(parseInt(currentBlockData.timestamp, 16) * 1000);
+        const currentBlock = await provider.getBlockNumber();
+        const currentBlockData = await provider.getBlock(currentBlock);
+        const currentTimestamp = new Date(Number(currentBlockData.timestamp) * 1000);
         
         console.log(`Current block: ${currentBlock}, timestamp: ${currentTimestamp.toISOString()}`);
         
@@ -32,8 +42,8 @@ export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
         
         while (lowerBound <= upperBound) {
             const midBlock = Math.floor((lowerBound + upperBound) / 2);
-            const blockData = await getBlockByNumber(midBlock, primaryRpc, fallbackRpc);
-            const blockTimestamp = new Date(parseInt(blockData.timestamp, 16) * 1000);
+            const blockData = await provider.getBlock(midBlock);
+            const blockTimestamp = new Date(Number(blockData.timestamp) * 1000);
             
             console.log(`Checking block ${midBlock}, timestamp: ${blockTimestamp.toISOString()}`);
             
@@ -43,7 +53,7 @@ export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
                 console.log(`Found closest block: ${midBlock}`);
                 
                 // Refine further to get exact block
-                return findExactBlockNearTarget(midBlock, targetDate, primaryRpc, fallbackRpc);
+                return findExactBlockNearTarget(provider, midBlock, targetDate);
             }
             
             if (blockTimestamp.getTime() < targetDate.getTime()) {
@@ -63,23 +73,22 @@ export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
 
 /**
  * Find the exact block at or just after the target date
+ * @param {ethers.Provider} provider Ethers provider
  * @param {number} approximateBlock Approximate block near the target time
  * @param {Date} targetDate Target date
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
  * @returns {Promise<number>} Exact block number
  */
-async function findExactBlockNearTarget(approximateBlock, targetDate, primaryRpc, fallbackRpc) {
+async function findExactBlockNearTarget(provider, approximateBlock, targetDate) {
     let currentBlock = approximateBlock;
-    let blockData = await getBlockByNumber(currentBlock, primaryRpc, fallbackRpc);
-    let blockTimestamp = new Date(parseInt(blockData.timestamp, 16) * 1000);
+    let blockData = await provider.getBlock(currentBlock);
+    let blockTimestamp = new Date(Number(blockData.timestamp) * 1000);
     
     // If before target date, move forward to find first block after target
     if (blockTimestamp.getTime() < targetDate.getTime()) {
         while (blockTimestamp.getTime() < targetDate.getTime()) {
             currentBlock++;
-            blockData = await getBlockByNumber(currentBlock, primaryRpc, fallbackRpc);
-            blockTimestamp = new Date(parseInt(blockData.timestamp, 16) * 1000);
+            blockData = await provider.getBlock(currentBlock);
+            blockTimestamp = new Date(Number(blockData.timestamp) * 1000);
         }
         return currentBlock;
     } 
@@ -87,82 +96,10 @@ async function findExactBlockNearTarget(approximateBlock, targetDate, primaryRpc
     else {
         while (blockTimestamp.getTime() >= targetDate.getTime() && currentBlock > 0) {
             currentBlock--;
-            blockData = await getBlockByNumber(currentBlock, primaryRpc, fallbackRpc);
-            blockTimestamp = new Date(parseInt(blockData.timestamp, 16) * 1000);
+            blockData = await provider.getBlock(currentBlock);
+            blockTimestamp = new Date(Number(blockData.timestamp) * 1000);
         }
         // Return the block right after the last block before target
         return currentBlock + 1;
-    }
-}
-
-/**
- * Get current block number
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<number>} Current block number
- */
-async function getCurrentBlock(primaryRpc, fallbackRpc) {
-    try {
-        const response = await makeRpcRequest(
-            { method: 'eth_blockNumber', params: [] },
-            primaryRpc,
-            fallbackRpc
-        );
-        return parseInt(response, 16);
-    } catch (error) {
-        console.error('Error getting current block:', error.message);
-        throw error;
-    }
-}
-
-/**
- * Get block data by number
- * @param {number} blockNumber Block number
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Object>} Block data
- */
-async function getBlockByNumber(blockNumber, primaryRpc, fallbackRpc) {
-    try {
-        const blockHex = `0x${blockNumber.toString(16)}`;
-        return await makeRpcRequest(
-            { method: 'eth_getBlockByNumber', params: [blockHex, false] },
-            primaryRpc,
-            fallbackRpc
-        );
-    } catch (error) {
-        console.error(`Error getting block ${blockNumber}:`, error.message);
-        throw error;
-    }
-}
-
-/**
- * Make RPC request with fallback
- * @param {Object} request RPC request
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<any>} RPC response
- */
-async function makeRpcRequest(request, primaryRpc, fallbackRpc) {
-    const payload = {
-        jsonrpc: '2.0',
-        id: 1,
-        ...request
-    };
-    
-    try {
-        const response = await axios.post(primaryRpc, payload);
-        return response.data.result;
-    } catch (primaryError) {
-        console.log(`Primary RPC failed: ${primaryError.message}`);
-        console.log('Trying fallback RPC...');
-        
-        try {
-            const response = await axios.post(fallbackRpc, payload);
-            return response.data.result;
-        } catch (fallbackError) {
-            console.error(`Fallback RPC also failed: ${fallbackError.message}`);
-            throw fallbackError;
-        }
     }
 }

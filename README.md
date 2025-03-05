@@ -1,6 +1,6 @@
 # SEI Voting Monitor
 
-A comprehensive solution for tracking and validating wallet voting activity on the SEI blockchain.
+Tracking and validating wallet voting activity for SEI Gitcoin funding rounds 6 and 7.
 
 ## Overview
 
@@ -10,6 +10,77 @@ This system monitors voting activities on a specific SEI blockchain contract and
 2. One block before voting
 3. At the end of the voting period
 
+## Data Collection Methodology
+
+### Vote Transaction Discovery
+
+The system uses two complementary methods to find voting transactions:
+
+1. **Primary Method: Internal Transaction Tracing**
+   - Uses `trace_filter` JSON-RPC API to find internal transactions from the proxy contract to the implementation contract
+   - Directly identifies token transfers that represent votes
+   - More efficient and accurate than event scanning for this specific contract design
+   - Example query:
+     ```json
+     {
+       "jsonrpc": "2.0",
+       "id": 1,
+       "method": "trace_filter",
+       "params": [{
+         "fromBlock": "0x807d110",
+         "toBlock": "0x8081f30",
+         "fromAddress": ["0x1e18cdce56b3754c4dca34cb3a7439c24e8363de"],
+         "toAddress": ["0x05b939069163891997c879288f0baac3faaf4500"],
+         "after": 0,
+         "count": 10000
+       }]
+     }
+     ```
+
+2. **Fallback Method: Block Scanning**
+   - Used when `trace_filter` is not available on the RPC endpoint
+   - Scans each block in the range and filters transactions sent to the proxy with non-zero value
+   - Verifies transaction success using receipt status
+   - Less efficient but more universally supported by all EVM nodes
+
+### Balance Verification
+
+The system employs dual verification approaches for maximum accuracy:
+
+1. **Cosmos API Balance Check**
+   - Converts EVM addresses to Cosmos addresses for native balance checks
+   - Queries historical balances at specific block heights
+   - Example endpoint: `/cosmos/bank/v1beta1/balances/{cosmosAddress}/by_denom?denom=usei`
+   - Includes block height header for historical queries
+
+2. **EVM API Balance Check**
+   - Fallback method using EVM RPC endpoints
+   - Gets native token balances directly from EVM accounts
+   - Standardizes decimal precision to match Cosmos representation (6 decimal places)
+
+3. **Validation Process**
+   - Checks balances at three critical points: vote time, one block before vote, and end of voting period
+   - Maintains precisely 6 decimal places for all balance comparisons
+   - Employs caching to reduce redundant API calls
+   - Records comprehensive data for auditing and verification
+
+### Data Resilience
+
+The system implements several measures to ensure data integrity:
+
+1. **Fallback Endpoints**
+   - Automatically switches between primary and archive nodes
+   - Uses archive nodes for historical data beyond primary node's retention period
+
+2. **Resumable Processing**
+   - Tracks last processed block for seamless continuation after interruptions
+   - Stores all data persistently in JSON files for review and data recovery
+
+3. **Error Handling**
+   - Gracefully handles API failures, rate limits, and network issues
+   - Implements exponential backoff for temporary failures
+   - Marks transactions as invalid when verification is impossible
+
 ## Project Structure
 
 ```
@@ -17,6 +88,7 @@ sei-voting-monitor/
 ├── index.js             # Main application entry point
 ├── contractReader.js    # Handles blockchain interactions and event reading
 ├── walletBalances.js    # Tracks and verifies wallet balances
+├── findStartBlock.js    # Utility to find exact starting block
 ├── contract-abi.js      # Contains contract ABI definitions
 ├── package.json         # Project dependencies
 ├── README.md            # Project documentation
@@ -69,61 +141,6 @@ This will:
 2. Check wallet balances at the time of voting and one block before
 3. Periodically check for new votes (every 12 hours)
 4. Generate a final report when the voting period ends
-
-### Fallback Mechanism
-
-The system includes a built-in fallback mechanism that automatically switches to archive nodes when:
-- Primary node doesn't have historical data
-- Primary node fails to respond or returns an error
-- Rate limits are encountered
-
-This ensures continuous monitoring even if your primary node has issues.
-
-## How It Works
-
-### Vote Detection
-
-1. The system scans for transactions to the voting contract with non-zero value
-2. For each transaction, it verifies:
-   - The transaction was successful
-   - The wallet has sufficient SEI at the time of voting and one block before
-
-### Balance Verification
-
-For each wallet that votes, the system:
-1. Converts the EVM address to a Cosmos address
-2. Checks the SEI balance at multiple points:
-   - At the block where the vote occurred
-   - One block before the vote
-   - At the end of the voting period
-3. Determines if the vote is valid based on all three balance checks
-
-### Reporting
-
-At the end of the voting period, the system generates:
-1. A console summary with statistics
-2. A CSV file with detailed vote information
-3. A CSV file with wallet balance information
-
-## Data Files
-
-- `wallets.json`: Stores wallet information including balances at various blocks
-- `votes.json`: Stores vote information including validity status
-- `last_processed_block.txt`: Tracks the last processed block for resuming operations
-- `voting_report.csv`: Comprehensive report of all votes
-- `wallet_report.csv`: Summary of wallet activity and balance status
-
-## API Endpoints
-
-The system uses multiple endpoints with fallback options:
-- Primary endpoints (basementnodes.ca): Used for most operations
-- Archive endpoints (ccvalidators.com): Used as fallback for historical data
-
-## Troubleshooting
-
-- If the monitor stops unexpectedly, it will automatically resume from the last processed block when restarted.
-- Logs are displayed in the console for monitoring progress and diagnosing issues.
-- If balance lookups fail, try specifying different RPC endpoints in the configuration.
 
 ## License
 

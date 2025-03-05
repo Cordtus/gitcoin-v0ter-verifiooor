@@ -1,7 +1,3 @@
-/**
- * This file contains the ABI definitions for the voting contracts
- */
-
 // Proxy contract ABI
 export const PROXY_ABI = [
     {

@@ -1,3 +1,5 @@
+// index.js
+
 import * as contractReader from './contractReader.js';
 import * as walletBalances from './walletBalances.js';
 import { findStartBlock } from './findStartBlock.js';
@@ -102,9 +104,9 @@ async function trackVotingActivity() {
         );
         console.log(`Current block: ${currentBlock}`);
 
-        // Fetch all logs in one request using the wrapper, which handles pagination internally
+        // Fetch voting events for the entire range
         try {
-            // Fetch voting events for the entire range
+            // Using the new implementation with trace_filter
             const events = await contractReader.fetchVotingEvents(
                 fromBlock, 
                 currentBlock, 
@@ -113,26 +115,14 @@ async function trackVotingActivity() {
                 RPC_ENDPOINTS.archive.evmRpc
             );
             
-            console.log(`Found ${events.length} events between blocks ${fromBlock} and ${currentBlock}`);
+            console.log(`Found ${events.length} voting transactions between blocks ${fromBlock} and ${currentBlock}`);
             
             // Process each event to find votes
             for (const event of events) {
-                const txDetails = await contractReader.getTransactionDetails(
-                    event.transactionHash,
-                    RPC_ENDPOINTS.primary.evmRpc,
-                    RPC_ENDPOINTS.archive.evmRpc
-                );
-                
-                // Skip if transaction failed or is not a vote
-                if (!txDetails || !txDetails.success || !txDetails.isVotingTransaction) {
-                    continue;
-                }
-                
-                // Get wallet balance at vote time and before
                 try {
                     // Convert EVM address to Cosmos address
                     const cosmosAddress = await walletBalances.convertEvmToCosmos(
-                        txDetails.from,
+                        event.from,
                         RPC_ENDPOINTS.primary.rest,
                         RPC_ENDPOINTS.archive.rest
                     );
@@ -140,25 +130,25 @@ async function trackVotingActivity() {
                     // Check balance at vote and one block before
                     const balanceAtVote = await walletBalances.getSeiBalance(
                         cosmosAddress, 
-                        txDetails.blockNumber,
+                        event.blockNumber,
                         RPC_ENDPOINTS.primary.rest,
                         RPC_ENDPOINTS.archive.rest
                     );
                     
                     const balanceBeforeVote = await walletBalances.getSeiBalance(
                         cosmosAddress, 
-                        txDetails.blockNumber - 1,
+                        event.blockNumber - 1,
                         RPC_ENDPOINTS.primary.rest,
                         RPC_ENDPOINTS.archive.rest
                     );
                     
                     // Record vote information
                     await walletBalances.recordVote(
-                        txDetails.hash,
-                        txDetails.from,
+                        event.transactionHash,
+                        event.from,
                         cosmosAddress,
-                        txDetails.blockNumber,
-                        txDetails.timestamp,
+                        event.blockNumber,
+                        event.timestamp,
                         balanceAtVote,
                         balanceBeforeVote,
                         MIN_SEI_REQUIRED,
@@ -166,11 +156,11 @@ async function trackVotingActivity() {
                         VOTES_FILE
                     );
                     
-                    console.log(`Processed vote: ${txDetails.hash} from ${txDetails.from}`);
+                    console.log(`Processed vote: ${event.transactionHash} from ${event.from}`);
                     console.log(`  Balance at vote: ${balanceAtVote} SEI`);
                     console.log(`  Balance before vote: ${balanceBeforeVote} SEI`);
                 } catch (error) {
-                    console.error(`Error processing vote ${txDetails.hash}:`, error.message);
+                    console.error(`Error processing vote ${event.transactionHash}:`, error.message);
                 }
             }
             
@@ -191,7 +181,9 @@ async function trackVotingActivity() {
                 WALLETS_FILE,
                 VOTES_FILE,
                 RPC_ENDPOINTS.primary.rest,
-                RPC_ENDPOINTS.archive.rest
+                RPC_ENDPOINTS.archive.rest,
+                RPC_ENDPOINTS.primary.evmRpc,
+                RPC_ENDPOINTS.archive.evmRpc
             );
             
             await walletBalances.generateReport(
