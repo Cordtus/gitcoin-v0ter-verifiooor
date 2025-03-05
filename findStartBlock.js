@@ -1,382 +1,359 @@
-// contractReader.js
+// findStartBlock.js
+// Efficiently finds the start block for the SEI voting period
 
 import { ethers } from 'ethers';
+import { retry, sleep, decimalToHex } from './utils.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import axios from 'axios';
-import { retry, sleep } from './utils.js';
 
-// Cache for block time lookups to minimize redundant API calls
-const blockTimeCache = new Map();
+// Get directory name in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-/**
- * Find the exact block number for a target date in UTC with optimized skipping
- * @param {Date} targetDate The target date to find the block for (should be in UTC)
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<number>} Block number
- */
-export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
-    // Ensure target date is in UTC
-    const targetUTC = new Date(targetDate.toISOString());
-    console.log(`Finding exact block for date (UTC): ${targetUTC.toISOString()}`);
-    
-    // Get current block using EVM RPC
-    let provider;
-    try {
-        provider = new ethers.JsonRpcProvider(primaryRpc);
-    } catch (error) {
-        console.log(`Primary RPC failed: ${error.message}`);
-        provider = new ethers.JsonRpcProvider(fallbackRpc);
+// Simplified LRU Cache using Map
+class LRUCache {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.cache = new Map();
+  }
+  
+  get(key) {
+    if (!this.cache.has(key)) return null;
+    const value = this.cache.get(key);
+    this.cache.delete(key);
+    this.cache.set(key, value);
+    return value;
+  }
+  
+  set(key, value) {
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    } else if (this.cache.size >= this.capacity) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
     }
-    
-    const currentBlockNumber = await provider.getBlockNumber();
-    console.log(`Current EVM block: ${currentBlockNumber}`);
-    
-    // Get current block timestamp
-    const currentBlockData = await getBlock(currentBlockNumber, provider);
-    const currentBlockTime = new Date(Number(currentBlockData.timestamp) * 1000);
-    
-    console.log(`Current block time: ${currentBlockTime.toISOString()}`);
-    
-    // Calculate time difference and estimate blocks
-    const timeDiffMs = targetUTC.getTime() - currentBlockTime.getTime();
-    const BLOCK_TIME_MS = 400; // SEI average block time in milliseconds
-    const estimatedBlockDiff = Math.floor(timeDiffMs / BLOCK_TIME_MS);
-    const estimatedBlock = Math.max(0, currentBlockNumber + estimatedBlockDiff);
-    
-    console.log(`Initial block estimate: ${estimatedBlock} (${estimatedBlockDiff} blocks from current)`);
-    
-    // If the estimated block is in the future, use current block
-    if (estimatedBlock > currentBlockNumber) {
-        console.log(`Estimated block is in the future, using current block`);
-        return currentBlockNumber;
-    }
-    
-    // Adaptive search range based on the time difference magnitude
-    // Larger time differences get larger search ranges
-    const timeDistanceHours = Math.abs(timeDiffMs) / (1000 * 60 * 60);
-    const searchRangeBlocks = Math.min(
-        50000, // Cap at 50,000 blocks
-        Math.max(
-            5000,  // Minimum of 5,000 blocks
-            Math.ceil(timeDistanceHours * 9000) // ~9,000 blocks per hour
-        )
-    );
-    
-    // Set up binary search bounds with the adaptive range
-    let lowerBound = Math.max(0, estimatedBlock - searchRangeBlocks);
-    let upperBound = Math.min(currentBlockNumber, estimatedBlock + searchRangeBlocks);
-    
-    console.log(`Setting search range: ${lowerBound} to ${upperBound} (${upperBound - lowerBound} blocks)`);
-    
-    // Optimized binary search with adaptive step sizes
-    let closestBlock = estimatedBlock;
-    let closestDiff = Infinity;
-    let iterations = 0;
-    const MAX_ITERATIONS = 20; // Prevent infinite loops
-    
-    while (lowerBound <= upperBound && iterations < MAX_ITERATIONS) {
-        iterations++;
-        
-        // Calculate midpoint
-        const midBlock = Math.floor((lowerBound + upperBound) / 2);
-        
-        // Get block time
-        const blockData = await getBlock(midBlock, provider);
-        const blockTime = new Date(Number(blockData.timestamp) * 1000);
-        
-        console.log(`[Iteration ${iterations}] Checking block ${midBlock}, time: ${blockTime.toISOString()}`);
-        
-        // Calculate time difference
-        const diffMs = Math.abs(blockTime.getTime() - targetUTC.getTime());
-        
-        // Keep track of closest block
-        if (diffMs < closestDiff) {
-            closestBlock = midBlock;
-            closestDiff = diffMs;
-        }
-        
-        // Exit early if we're within 1 second of the target
-        if (diffMs < 1000) {
-            console.log(`Found very close block: ${midBlock} (within 1 second)`);
-            return refineExactBlock(midBlock, targetUTC, provider);
-        }
-        
-        // Adjust bounds for next iteration
-        if (blockTime.getTime() < targetUTC.getTime()) {
-            lowerBound = midBlock + 1;
-        } else {
-            upperBound = midBlock - 1;
-        }
-        
-        // Adaptive skipping for faster convergence
-        // As we get closer to the target, we reduce the skip size
-        if (diffMs > 3600000) { // More than 1 hour away
-            // Skip by larger chunks (e.g., 9000 blocks ~= 1 hour)
-            const skipSize = Math.ceil(diffMs / 400);
-            if (blockTime.getTime() < targetUTC.getTime()) {
-                lowerBound = midBlock + Math.ceil(skipSize / 3);
-            } else {
-                upperBound = midBlock - Math.ceil(skipSize / 3);
-            }
-        }
-    }
-    
-    // If we couldn't find a block within 1 second, use the closest we found
-    console.log(`Using closest block after ${iterations} iterations: ${closestBlock} (off by ${closestDiff}ms)`);
-    
-    // Final refinement
-    return refineExactBlock(closestBlock, targetUTC, provider);
+    this.cache.set(key, value);
+  }
 }
 
+const blockTimeCache = new LRUCache(1000);
+
+// Voting period dates in UTC and average block time in ms
+const VOTING_START_DATE = new Date('2025/02/27 05:00Z');
+const VOTING_END_DATE = new Date('2025/03/12 17:00Z');
+const SEI_BLOCK_TIME_MS = 400;
+
+// RPC endpoints
+const RPC_ENDPOINTS = {
+  primary: 'https://evm-rpc.sei.basementnodes.ca',
+  fallback: 'https://evm.sei-main-eu.ccvalidators.com:443',
+  cosmos: 'https://rpc.sei.basementnodes.ca'
+};
+
 /**
- * Find the exact block at or just after the target date
- * @param {number} approximateBlock Approximate block near the target time
- * @param {Date} targetDate Target date in UTC
- * @param {ethers.Provider} provider Ethers provider
- * @returns {Promise<number>} Exact block number
+ * Get current Cosmos block data
+ * @returns {Promise<{blockHeight: number, blockTime: Date}>}
  */
-async function refineExactBlock(approximateBlock, targetDate, provider) {
-    console.log(`Refining exact block around ${approximateBlock}...`);
-    
-    let searchBlock = approximateBlock;
-    let blockData = await getBlock(searchBlock, provider);
-    let blockTime = new Date(Number(blockData.timestamp) * 1000);
-    
-    // If before target date, move forward to find first block after target
-    if (blockTime.getTime() < targetDate.getTime()) {
-        console.log('Block is before target date, moving forward...');
-        
-        let previousBlock = searchBlock;
-        let previousTime = blockTime;
-        let consecutiveBlocksMoved = 0;
-        
-        while (blockTime.getTime() < targetDate.getTime()) {
-            previousBlock = searchBlock;
-            previousTime = blockTime;
-            
-            // Adaptive skip size based on how far we are from target
-            const timeGap = targetDate.getTime() - blockTime.getTime();
-            const blocksToSkip = Math.max(1, Math.min(100, Math.ceil(timeGap / 400)));
-            
-            searchBlock += blocksToSkip;
-            consecutiveBlocksMoved += blocksToSkip;
-            
-            // Safety check - break if we've moved too many blocks
-            if (consecutiveBlocksMoved > 1000) {
-                console.log(`Safety limit reached after moving ${consecutiveBlocksMoved} blocks forward`);
-                break;
-            }
-            
-            blockData = await getBlock(searchBlock, provider);
-            blockTime = new Date(Number(blockData.timestamp) * 1000);
-            console.log(`Testing forward block ${searchBlock}: ${blockTime.toISOString()}`);
-        }
-        
-        // Binary search between previous and current block for exact transition
-        if (previousBlock < searchBlock - 1) {
-            console.log(`Narrowing between blocks ${previousBlock} and ${searchBlock}`);
-            let lower = previousBlock;
-            let upper = searchBlock;
-            
-            while (lower < upper - 1) {
-                const mid = Math.floor((lower + upper) / 2);
-                const midData = await getBlock(mid, provider);
-                const midTime = new Date(Number(midData.timestamp) * 1000);
-                
-                if (midTime.getTime() < targetDate.getTime()) {
-                    lower = mid;
-                } else {
-                    upper = mid;
-                }
-            }
-            
-            searchBlock = upper;
-            blockData = await getBlock(searchBlock, provider);
-            blockTime = new Date(Number(blockData.timestamp) * 1000);
-        }
-        
-        console.log(`Found first block after target: ${searchBlock} at ${blockTime.toISOString()}`);
-        return searchBlock;
-    } 
-    // If after target date, move backward to find last block before target
-    else {
-        console.log('Block is after target date, moving backward...');
-        
-        let nextBlock = searchBlock;
-        let nextTime = blockTime;
-        let consecutiveBlocksMoved = 0;
-        
-        while (blockTime.getTime() >= targetDate.getTime() && searchBlock > 0) {
-            nextBlock = searchBlock;
-            nextTime = blockTime;
-            
-            // Adaptive skip size based on how far we are from target
-            const timeGap = blockTime.getTime() - targetDate.getTime();
-            const blocksToSkip = Math.max(1, Math.min(100, Math.ceil(timeGap / 400)));
-            
-            searchBlock -= blocksToSkip;
-            consecutiveBlocksMoved += blocksToSkip;
-            
-            // Safety check - break if we've moved too many blocks
-            if (consecutiveBlocksMoved > 1000) {
-                console.log(`Safety limit reached after moving ${consecutiveBlocksMoved} blocks backward`);
-                break;
-            }
-            
-            blockData = await getBlock(searchBlock, provider);
-            blockTime = new Date(Number(blockData.timestamp) * 1000);
-            console.log(`Testing backward block ${searchBlock}: ${blockTime.toISOString()}`);
-        }
-        
-        // Binary search between current and next block for exact transition
-        if (searchBlock < nextBlock - 1) {
-            console.log(`Narrowing between blocks ${searchBlock} and ${nextBlock}`);
-            let lower = searchBlock;
-            let upper = nextBlock;
-            
-            while (lower < upper - 1) {
-                const mid = Math.floor((lower + upper) / 2);
-                const midData = await getBlock(mid, provider);
-                const midTime = new Date(Number(midData.timestamp) * 1000);
-                
-                if (midTime.getTime() < targetDate.getTime()) {
-                    lower = mid;
-                } else {
-                    upper = mid;
-                }
-            }
-            
-            searchBlock = lower;
-            nextBlock = upper;
-        }
-        
-        // Return the block right after the last block before target
-        console.log(`Found transition between blocks ${searchBlock} and ${nextBlock}`);
-        return nextBlock;
+async function getCurrentCosmosBlock() {
+  try {
+    const response = await axios.get(`${RPC_ENDPOINTS.cosmos}/block`, { timeout: 5000 });
+    if (response.data?.block?.header) {
+      const blockHeight = parseInt(response.data.block.header.height);
+      const blockTime = new Date(response.data.block.header.time);
+      console.log(`Current Cosmos block: ${blockHeight}, time: ${blockTime.toISOString()}`);
+      return { blockHeight, blockTime };
     }
+    throw new Error('Invalid response format from Cosmos API');
+  } catch (error) {
+    console.error('Error fetching current Cosmos block:', error.message);
+    throw error;
+  }
 }
 
 /**
  * Get block data with caching
- * @param {number} blockNumber Block number to get
+ * @param {number} blockNumber Block number
  * @param {ethers.Provider} provider Ethers provider
  * @returns {Promise<Object>} Block data
  */
 async function getBlock(blockNumber, provider) {
-    // Check cache first
-    if (blockTimeCache.has(blockNumber)) {
-        return blockTimeCache.get(blockNumber);
+  const cached = blockTimeCache.get(blockNumber);
+  if (cached) return cached;
+  try {
+    const blockPromise = provider.getBlock(blockNumber);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNumber}`)), 8000)
+    );
+    const block = await Promise.race([blockPromise, timeoutPromise]);
+    if (!block) throw new Error(`Block ${blockNumber} not found`);
+    blockTimeCache.set(blockNumber, block);
+    return block;
+  } catch (error) {
+    console.error(`Error getting block ${blockNumber}:`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Find the closest block to a target date using binary search
+ * @param {Date} targetDate Target date
+ * @param {number} startBlock Starting block for search
+ * @param {number} endBlock Ending block for search
+ * @param {ethers.Provider} provider Ethers provider
+ * @returns {Promise<number>} Closest block number
+ */
+async function findBlockForDate(targetDate, startBlock, endBlock, provider) {
+  console.log(`Finding block closest to ${targetDate.toISOString()}`);
+  console.log(`Search range: ${startBlock} to ${endBlock}`);
+  
+  const targetTime = targetDate.getTime() / 1000;
+  let lowerBound = startBlock;
+  let upperBound = endBlock;
+  let closestBlock = -1;
+  let closestDiff = Infinity;
+  let iterations = 0;
+  const MAX_ITERATIONS = 20;
+  const visitedBlocks = new Set();
+  
+  while (lowerBound <= upperBound && iterations < MAX_ITERATIONS) {
+    iterations++;
+    let midBlock = Math.floor((lowerBound + upperBound) / 2);
+    
+    if (visitedBlocks.has(midBlock)) {
+      let found = false;
+      for (let offset = 1; offset < 10; offset++) {
+        let candidate = midBlock + offset;
+        if (candidate <= upperBound && !visitedBlocks.has(candidate)) {
+          midBlock = candidate;
+          found = true;
+          break;
+        }
+        candidate = midBlock - offset;
+        if (candidate >= lowerBound && !visitedBlocks.has(candidate)) {
+          midBlock = candidate;
+          found = true;
+          break;
+        }
+      }
+      if (!found) break;
     }
     
-    try {
-        // Set a timeout for the request
-        const blockPromise = provider.getBlock(blockNumber);
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNumber}`)), 10000);
-        });
-        
-        const block = await Promise.race([blockPromise, timeoutPromise]);
-        
-        if (!block) {
-            throw new Error(`Block ${blockNumber} not found`);
-        }
-        
-        // Cache the result
-        blockTimeCache.set(blockNumber, block);
-        
-        // Limit cache size to prevent memory issues
-        if (blockTimeCache.size > 1000) {
-            const oldestKey = blockTimeCache.keys().next().value;
-            blockTimeCache.delete(oldestKey);
-        }
-        
-        return block;
-    } catch (error) {
-        console.error(`Error getting block ${blockNumber}:`, error.message);
-        throw error;
+    visitedBlocks.add(midBlock);
+    const blockData = await getBlock(midBlock, provider);
+    const blockTimeSecs = Number(blockData.timestamp);
+    const blockTime = new Date(blockTimeSecs * 1000);
+    console.log(`[Iteration ${iterations}] Checking block ${midBlock}, time: ${blockTime.toISOString()}`);
+    
+    const timeDiff = Math.abs(blockTimeSecs - targetTime);
+    if (timeDiff < closestDiff) {
+      closestBlock = midBlock;
+      closestDiff = timeDiff;
     }
+    if (timeDiff < 1) {
+      console.log(`Found very close block: ${midBlock} (within 1 second)`);
+      return midBlock;
+    }
+    
+    if (blockTimeSecs < targetTime) {
+      lowerBound = midBlock + 1;
+    } else {
+      upperBound = midBlock - 1;
+    }
+    
+    // Adaptive skipping for faster convergence
+    if (timeDiff > 3600) { // More than 1 hour away
+      const skipBlocks = Math.ceil((upperBound - lowerBound) / 4);
+      if (blockTimeSecs < targetTime) {
+        lowerBound = midBlock + skipBlocks;
+      } else {
+        upperBound = midBlock - skipBlocks;
+      }
+    } else if (timeDiff > 600) { // More than 10 minutes away
+      const skipBlocks = Math.ceil(timeDiff / SEI_BLOCK_TIME_MS * 1000);
+      if (blockTimeSecs < targetTime) {
+        lowerBound = midBlock + skipBlocks;
+      } else {
+        upperBound = midBlock - skipBlocks;
+      }
+    }
+  }
+  
+  console.log(`Using closest block after ${iterations} iterations: ${closestBlock} (off by ${closestDiff}s)`);
+  return closestBlock;
 }
 
 /**
- * Check availability of a block on the given RPC
- * @param {number} blockNumber Block to check 
- * @param {string} rpcUrl RPC URL
- * @param {number} timeout Timeout in milliseconds
- * @returns {Promise<boolean>} Whether the block is available
- */
-export async function checkBlockAvailability(blockNumber, rpcUrl, timeout = 5000) {
-    return await retry(async () => {
-        try {
-            console.log(`Checking if block ${blockNumber} is available on ${rpcUrl}...`);
-            
-            const provider = new ethers.JsonRpcProvider(rpcUrl);
-            
-            // Set timeout for block check
-            const blockPromise = provider.getBlock(blockNumber);
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error('Block availability check timed out')), timeout);
-            });
-            
-            const block = await Promise.race([blockPromise, timeoutPromise]);
-            
-            if (block) {
-                console.log(`Block ${blockNumber} is available on ${rpcUrl}`);
-                return true;
-            } else {
-                console.log(`Block ${blockNumber} not found on ${rpcUrl}`);
-                return false;
-            }
-        } catch (error) {
-            console.error(`Error checking block availability: ${error.message}`);
-            return false;
-        }
-    }, 3, 1000); // Retry up to 3 times with 1s initial delay
-}
-
-/**
- * Estimate the current block number for a future time
- * @param {Date} futureDate Future date to estimate block for
- * @param {string} primaryRpc Primary RPC endpoint 
+ * Create provider with automatic fallback
+ * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<number>} Estimated block number
+ * @returns {ethers.Provider} Ethers provider
  */
-export async function estimateFutureBlock(futureDate, primaryRpc, fallbackRpc) {
-    // Get current block and time
-    let provider;
-    try {
-        provider = new ethers.JsonRpcProvider(primaryRpc);
-    } catch (error) {
-        console.log(`Primary RPC failed: ${error.message}`);
-        provider = new ethers.JsonRpcProvider(fallbackRpc);
-    }
-    
-    const currentBlockNumber = await provider.getBlockNumber();
-    const currentBlockData = await getBlock(currentBlockNumber, provider);
-    const currentTime = new Date(Number(currentBlockData.timestamp) * 1000);
-    
-    // Calculate time difference and estimate blocks
-    const timeDiffMs = futureDate.getTime() - currentTime.getTime();
-    if (timeDiffMs <= 0) {
-        console.log(`Requested date is not in the future, returning current block`);
-        return currentBlockNumber;
-    }
-    
-    const BLOCK_TIME_MS = 400; // SEI average block time in milliseconds
-    const estimatedBlockDiff = Math.floor(timeDiffMs / BLOCK_TIME_MS);
-    const estimatedBlock = currentBlockNumber + estimatedBlockDiff;
-    
-    console.log(`Current block: ${currentBlockNumber}, time: ${currentTime.toISOString()}`);
-    console.log(`Estimated block for ${futureDate.toISOString()}: ${estimatedBlock}`);
-    console.log(`Approximately ${estimatedBlockDiff} blocks from now`);
-    
-    return estimatedBlock;
+function createProvider(primaryRpc, fallbackRpc) {
+  try {
+    const provider = new ethers.JsonRpcProvider(primaryRpc);
+    console.log('Using primary RPC endpoint');
+    return provider;
+  } catch (error) {
+    console.log(`Primary RPC failed: ${error.message}`);
+    console.log('Using fallback RPC endpoint');
+    return new ethers.JsonRpcProvider(fallbackRpc);
+  }
 }
 
 /**
- * Clear the block time cache
+ * Find the start block for the voting period
+ * @param {Date} targetDate Target date (UTC)
+ * @param {string} primaryRpc Primary EVM RPC endpoint
+ * @param {string} fallbackRpc Fallback EVM RPC endpoint 
+ * @returns {Promise<number>} The block number that closely matches the target date
  */
-export function clearBlockTimeCache() {
-    const cacheSize = blockTimeCache.size;
-    blockTimeCache.clear();
-    console.log(`Cleared block time cache (${cacheSize} entries)`);
+export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
+  try {
+    console.log(`Finding start block for voting period (${targetDate.toISOString()})`);
+    
+    // Get current block info
+    await getCurrentCosmosBlock(); // Just for informational purposes
+    const provider = createProvider(primaryRpc, fallbackRpc);
+    const currentBlockNumber = await provider.getBlockNumber();
+    console.log(`Current EVM block number: ${currentBlockNumber}`);
+    
+    const currentBlock = await getBlock(currentBlockNumber, provider);
+    const currentBlockTime = new Date(Number(currentBlock.timestamp) * 1000);
+    console.log(`Current EVM block time: ${currentBlockTime.toISOString()}`);
+    
+    // If target date is in the future, use current block
+    if (targetDate > currentBlockTime) {
+      console.log(`Target date is in the future, using current block ${currentBlockNumber}`);
+      return currentBlockNumber;
+    }
+    
+    // Calculate approximate start block
+    const msTimeDiff = currentBlockTime.getTime() - targetDate.getTime();
+    const approxBlocksBack = Math.ceil(msTimeDiff / SEI_BLOCK_TIME_MS);
+    const approxStartBlock = Math.max(1, currentBlockNumber - approxBlocksBack);
+    console.log(`Approximate start block: ${approxStartBlock} (using ${SEI_BLOCK_TIME_MS}ms average block time)`);
+    
+    // Set reasonable search range
+    const searchRange = Math.min(20000, Math.floor(approxBlocksBack / 2));
+    const startSearchBlock = Math.max(1, approxStartBlock - searchRange);
+    const endSearchBlock = approxStartBlock + searchRange;
+    console.log(`Setting search range: ${startSearchBlock} to ${endSearchBlock}`);
+    
+    // Find exact start block using binary search
+    const exactStartBlock = await findBlockForDate(targetDate, startSearchBlock, endSearchBlock, provider);
+    console.log(`Found exact start block: ${exactStartBlock}`);
+    
+    // Convert to hex for EVM RPC calls
+    const hexBlock = decimalToHex(exactStartBlock);
+    console.log(`Start block in hex: ${hexBlock}`);
+    
+    return exactStartBlock;
+  } catch (error) {
+    console.error('Error finding start block:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get exact block range for voting period (start and end blocks)
+ * @returns {Promise<Object>} Object with voting period information
+ */
+export async function getBlockRangeForVotingPeriod() {
+  try {
+    console.log('=== FINDING BLOCKS FOR SEI VOTING PERIOD ===');
+    console.log(`Voting start date (UTC): ${VOTING_START_DATE.toISOString()}`);
+    console.log(`Voting end date (UTC): ${VOTING_END_DATE.toISOString()}`);
+    
+    const provider = createProvider(RPC_ENDPOINTS.primary, RPC_ENDPOINTS.fallback);
+    const currentBlockNumber = await provider.getBlockNumber();
+    console.log(`Current block number: ${currentBlockNumber}`);
+    
+    // Find start block
+    const startBlock = await findStartBlock(
+      VOTING_START_DATE, 
+      RPC_ENDPOINTS.primary, 
+      RPC_ENDPOINTS.fallback
+    );
+    console.log(`\nVoting period start block: ${startBlock}`);
+    
+    // Find or estimate end block
+    let endBlock = null;
+    const now = new Date();
+    
+    if (now > VOTING_END_DATE) {
+      // If voting period has ended, find the exact end block
+      endBlock = await findStartBlock(
+        VOTING_END_DATE,
+        RPC_ENDPOINTS.primary,
+        RPC_ENDPOINTS.fallback
+      );
+      console.log(`\nVoting period end block: ${endBlock}`);
+    } else {
+      // Calculate approximate end block for testing
+      console.log('\nVoting end date is in the future, using approximate end block');
+      const msFromStartToEnd = VOTING_END_DATE.getTime() - VOTING_START_DATE.getTime();
+      const approxBlocksFromStartToEnd = Math.ceil(msFromStartToEnd / SEI_BLOCK_TIME_MS);
+      endBlock = startBlock + approxBlocksFromStartToEnd;
+      console.log(`Approximate end block (based on ${SEI_BLOCK_TIME_MS}ms block time): ${endBlock}`);
+    }
+    
+    // Generate result object with test ranges
+    const result = {
+      generatedAt: new Date().toISOString(),
+      votingPeriod: {
+        startDate: VOTING_START_DATE.toISOString(),
+        endDate: VOTING_END_DATE.toISOString(),
+        startBlock,
+        endBlock: endBlock || 'Not yet reached'
+      },
+      testRanges: {
+        fullRange: { 
+          start: startBlock, 
+          end: endBlock || currentBlockNumber 
+        },
+        initialSample: { 
+          start: startBlock, 
+          end: startBlock + 5000 // First 5000 blocks (~33 minutes)
+        },
+        midSample: {
+          start: Math.max(startBlock, Math.floor((startBlock + (endBlock || currentBlockNumber)) / 2) - 2500),
+          end: Math.min((endBlock || currentBlockNumber), Math.floor((startBlock + (endBlock || currentBlockNumber)) / 2) + 2500)
+        },
+        latestSample: { 
+          start: Math.max(startBlock, currentBlockNumber - 5000), 
+          end: currentBlockNumber 
+        }
+      },
+      currentBlock: currentBlockNumber
+    };
+    
+    // Save to file
+    const outputFile = path.join(__dirname, 'sei_voting_block_range.json');
+    fs.writeFileSync(outputFile, JSON.stringify(result, null, 2));
+    
+    // Print recommended ranges
+    console.log('\n=== RECOMMENDED BLOCK RANGES FOR TESTING ===');
+    console.log(`Full voting period: ${result.testRanges.fullRange.start} to ${result.testRanges.fullRange.end}`);
+    console.log(`Initial sample: ${result.testRanges.initialSample.start} to ${result.testRanges.initialSample.end}`);
+    console.log(`Mid-period sample: ${result.testRanges.midSample.start} to ${result.testRanges.midSample.end}`);
+    console.log(`Latest sample: ${result.testRanges.latestSample.start} to ${result.testRanges.latestSample.end}`);
+    console.log(`\nResults saved to: ${outputFile}`);
+    
+    // Example for test script
+    console.log('\n=== COPY-PASTE FOR TEST SCRIPT ===');
+    console.log(`const TEST_START_BLOCK = ${result.testRanges.initialSample.start}; // Initial voting period sample`);
+    console.log(`const TEST_END_BLOCK = ${result.testRanges.initialSample.end};`);
+    
+    return result;
+  } catch (error) {
+    console.error('Error determining block range:', error);
+    throw error;
+  }
+}
+
+// Execute if this file is run directly
+if (import.meta.url === `file://${process.argv[1]}`) {
+  getBlockRangeForVotingPeriod().catch(console.error);
 }

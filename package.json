@@ -10,7 +10,7 @@
     "report": "node generateReport.js",
     "convert:dectohex": "node scripts/dectohex.js",
     "convert:hextodec": "node scripts/hextodec.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node ./scripts/getTestRange.js && node ./scripts/test.js"
   },
   "keywords": [
     "sei",
@@ -24,6 +24,7 @@
   "dependencies": {
     "axios": "^1.8.1",
     "ethers": "^6.13.5",
+    "papaparse": "^5.5.2",
     "sei-logs-wrapper": "^1.1.1"
   },
   "devDependencies": {

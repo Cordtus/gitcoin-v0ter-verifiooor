@@ -2,8 +2,11 @@
 
 import * as contractReader from './contractReader.js';
 import * as walletBalances from './walletBalances.js';
-import { findStartBlock } from './findStartBlock.js';
 import * as memoryManager from './memoryManager.js';
+import { findStartBlock, getBlockRangeForVotingPeriod } from './findStartBlock.js';
+import { scanBlockRangeForVotes } from './blockScanner.js';
+import { monitorForVotes, saveMonitorCheckpoint, loadMonitorCheckpoint } from './realTimeMonitor.js';
+import { BatchProcessor } from './batchProcessor.js';
 import { retry, sleep, formatDateUTC } from './utils.js';
 import fs from 'fs';
 import path from 'path';

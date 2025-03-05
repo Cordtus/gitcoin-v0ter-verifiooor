@@ -2,7 +2,7 @@
  * Memory management utilities for the SEI Voting Monitor
  */
 
-import * as contractReader from './contractReader.js';
+import * as contractReader from './blockScanner.js';
 import * as walletBalances from './walletBalances.js';
 
 // Default thresholds in MB

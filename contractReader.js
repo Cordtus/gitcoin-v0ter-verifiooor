@@ -1,27 +1,100 @@
-// contractReader.js
+// Updated contractReader.js with enhanced voting detection
 
 import { ethers } from 'ethers';
 import axios from 'axios';
 import { retry, sleep } from './utils.js';
 
 // Constants for performance optimization
-const INITIAL_FETCH_BATCH_SIZE = 10000; // Larger batch size for initial fetch
-const LIVE_FETCH_BATCH_SIZE = 100;      // Smaller batch size for live monitoring
-const MAX_CONCURRENT_BATCHES = 5;       // Maximum number of concurrent batch requests
-const REQUEST_THROTTLE_MS = 50;         // Milliseconds to wait between requests
+const INITIAL_FETCH_BATCH_SIZE = 5000;  // For initial historical fetch
+const LIVE_FETCH_BATCH_SIZE = 100;      // For live monitoring
+const MAX_CONCURRENT_BATCHES = 3;       // Concurrency limit
+const REQUEST_THROTTLE_MS = 100;        // Throttle between requests
 
-// Cache for blocks and transactions
-const blockCache = new Map();
-const txCache = new Map();
+// Voting detection constants - VERIFIED from testing
+const PROXY_ADDRESS = '0x1E18cdce56B3754c4Dca34CB3a7439C24E8363de'.toLowerCase();
+const IMPLEMENTATION_ADDRESS = '0x05b939069163891997C879288f0BaaC3faaf4500'.toLowerCase();
+const VOTE_METHOD_SIG = '0xc7b8896b'; // Method used in all voting transactions
 
-// Cache statistics
-let blockCacheHits = 0;
-let blockCacheMisses = 0;
-let txCacheHits = 0;
-let txCacheMisses = 0;
+// Cache implementation with TTL and hit tracking
+class Cache {
+  constructor(name, maxSize = 5000, ttlMs = 30 * 60 * 1000) {
+    this.name = name;
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+    this.cache = new Map();
+    this.timestamps = new Map();
+    this.hits = 0;
+    this.misses = 0;
+  }
+
+  has(key) {
+    if (!this.cache.has(key)) return false;
+    
+    const timestamp = this.timestamps.get(key);
+    if (Date.now() - timestamp > this.ttlMs) {
+      // Expired entry
+      this.cache.delete(key);
+      this.timestamps.delete(key);
+      return false;
+    }
+    
+    return true;
+  }
+
+  get(key) {
+    if (!this.has(key)) {
+      this.misses++;
+      return null;
+    }
+    
+    this.hits++;
+    return this.cache.get(key);
+  }
+
+  set(key, value) {
+    // Check if we need to evict entries
+    if (this.cache.size >= this.maxSize) {
+      // Find oldest entries
+      const entries = [...this.timestamps.entries()]
+        .sort((a, b) => a[1] - b[1])
+        .slice(0, Math.ceil(this.maxSize * 0.2)); // Remove 20% oldest
+      
+      for (const [entryKey] of entries) {
+        this.cache.delete(entryKey);
+        this.timestamps.delete(entryKey);
+      }
+    }
+    
+    this.cache.set(key, value);
+    this.timestamps.set(key, Date.now());
+  }
+  
+  clear() {
+    this.cache.clear();
+    this.timestamps.clear();
+  }
+  
+  size() {
+    return this.cache.size;
+  }
+  
+  getStats() {
+    return {
+      size: this.cache.size,
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: this.hits / (this.hits + this.misses || 1)
+    };
+  }
+}
+
+// Export caches for shared use
+export const blockCache = new Cache('blocks', 2000);
+export const txCache = new Cache('transactions', 5000);
+export const receiptCache = new Cache('receipts', 5000);
 
 /**
- * Get current block height
+ * Get current block height with fallback
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
  * @returns {Promise<number>} Current block height
@@ -30,20 +103,199 @@ export async function getCurrentBlockHeight(primaryRpc, fallbackRpc) {
     return await retry(async () => {
         try {
             const provider = new ethers.JsonRpcProvider(primaryRpc);
-            return await provider.getBlockNumber();
+            const blockNumber = await provider.getBlockNumber();
+            console.log(`Current block height from primary RPC: ${blockNumber}`);
+            return blockNumber;
         } catch (error) {
             console.error('Primary RPC failed, trying fallback:', error.message);
             const provider = new ethers.JsonRpcProvider(fallbackRpc);
-            return await provider.getBlockNumber();
+            const blockNumber = await provider.getBlockNumber();
+            console.log(`Current block height from fallback RPC: ${blockNumber}`);
+            return blockNumber;
         }
-    });
+    }, 3, 1000);
 }
 
 /**
- * Fetch voting events using best available method
+ * Check if a transaction is a vote based on multiple detection methods
+ * @param {Object} tx Transaction object
+ * @param {Object} receipt Transaction receipt
+ * @returns {Object} Vote check results
+ */
+function isVoteTransaction(tx, receipt) {
+    if (!tx || !receipt) return { isVote: false };
+    
+    // Method 1: Direct transfer to proxy
+    const isDirectTransfer = 
+        tx.to && 
+        tx.to.toLowerCase() === PROXY_ADDRESS && 
+        tx.value > 0n;
+    
+    // Method 2: Method call to proxy with vote signature
+    const isMethodCall = 
+        tx.to && 
+        tx.to.toLowerCase() === PROXY_ADDRESS && 
+        tx.data && 
+        tx.data.startsWith(VOTE_METHOD_SIG);
+    
+    // Method 3: Has logs from implementation contract
+    const hasImplLogs = receipt.logs && receipt.logs.some(log => 
+        log.address && log.address.toLowerCase() === IMPLEMENTATION_ADDRESS
+    );
+    
+    // Method 4: Has logs from proxy contract
+    const hasProxyLogs = receipt.logs && receipt.logs.some(log => 
+        log.address && log.address.toLowerCase() === PROXY_ADDRESS
+    );
+    
+    // Final determination - ANY method is valid
+    const isVote = (isDirectTransfer || isMethodCall || hasImplLogs || hasProxyLogs);
+    
+    let detectionMethod = '';
+    if (isDirectTransfer) detectionMethod += 'direct-transfer,';
+    if (isMethodCall) detectionMethod += 'method-call,';
+    if (hasImplLogs) detectionMethod += 'impl-logs,';
+    if (hasProxyLogs) detectionMethod += 'proxy-logs,';
+    detectionMethod = detectionMethod.slice(0, -1); // Remove trailing comma
+    
+    return {
+        isVote,
+        detectionMethod: detectionMethod || 'none',
+        value: tx.value,
+        valueInSei: tx.value > 0n ? ethers.formatEther(tx.value) : '0',
+        data: tx.data
+    };
+}
+
+/**
+ * Get block with transactions
+ * @param {number} blockNumber Block number
+ * @param {ethers.JsonRpcProvider} provider Ethers provider
+ * @returns {Promise<Object>} Block with transactions
+ */
+async function getBlockWithTransactions(blockNumber, provider) {
+    const cacheKey = `block-${blockNumber}`;
+    if (blockCache.has(cacheKey)) {
+        return blockCache.get(cacheKey);
+    }
+    
+    try {
+        const blockPromise = provider.getBlock(blockNumber, true);
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNumber}`)), 10000);
+        });
+        
+        const block = await Promise.race([blockPromise, timeoutPromise]);
+        
+        if (!block) {
+            throw new Error(`Block ${blockNumber} not found`);
+        }
+        
+        blockCache.set(cacheKey, block);
+        return block;
+    } catch (error) {
+        console.error(`Error getting block ${blockNumber}:`, error.message);
+        throw error;
+    }
+}
+
+/**
+ * Get transaction receipt
+ * @param {string} txHash Transaction hash
+ * @param {ethers.JsonRpcProvider} provider Ethers provider
+ * @returns {Promise<Object>} Transaction receipt
+ */
+async function getTransactionReceipt(txHash, provider) {
+    const cacheKey = `receipt-${txHash}`;
+    if (receiptCache.has(cacheKey)) {
+        return receiptCache.get(cacheKey);
+    }
+    
+    try {
+        const receiptPromise = provider.getTransactionReceipt(txHash);
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Receipt retrieval timed out for tx ${txHash}`)), 10000);
+        });
+        
+        const receipt = await Promise.race([receiptPromise, timeoutPromise]);
+        
+        if (receipt) {
+            receiptCache.set(cacheKey, receipt);
+        }
+        
+        return receipt;
+    } catch (error) {
+        console.error(`Error getting receipt for ${txHash}:`, error.message);
+        throw error;
+    }
+}
+
+/**
+ * Process a block for voting transactions
+ * @param {number} blockNumber Block number to process
+ * @param {ethers.JsonRpcProvider} provider Ethers provider
+ * @returns {Promise<Array>} Array of vote objects
+ */
+async function processBlockForVotes(blockNumber, provider) {
+    try {
+        const block = await getBlockWithTransactions(blockNumber, provider);
+        
+        if (!block || !block.transactions || block.transactions.length === 0) {
+            return [];
+        }
+        
+        // Filter potentially relevant transactions
+        const relevantTxs = block.transactions.filter(tx => 
+            tx.to && (
+                tx.to.toLowerCase() === PROXY_ADDRESS || 
+                tx.to.toLowerCase() === IMPLEMENTATION_ADDRESS
+            )
+        );
+        
+        if (relevantTxs.length === 0) {
+            return [];
+        }
+        
+        const votes = [];
+        
+        for (const tx of relevantTxs) {
+            const receipt = await getTransactionReceipt(tx.hash, provider);
+            
+            if (!receipt || receipt.status !== 1) {
+                continue; // Skip failed transactions
+            }
+            
+            const voteCheck = isVoteTransaction(tx, receipt);
+            
+            if (voteCheck.isVote) {
+                console.log(`Vote found at block ${blockNumber}: ${tx.hash} (${voteCheck.detectionMethod})`);
+                
+                votes.push({
+                    transactionHash: tx.hash,
+                    blockNumber: Number(block.number),
+                    from: tx.from,
+                    to: tx.to,
+                    value: voteCheck.valueInSei,
+                    voteAmount: parseFloat(voteCheck.valueInSei), // For consistent type
+                    timestamp: new Date(Number(block.timestamp) * 1000),
+                    method: voteCheck.detectionMethod,
+                    success: true
+                });
+            }
+        }
+        
+        return votes;
+    } catch (error) {
+        console.error(`Error processing block ${blockNumber}:`, error.message);
+        return [];
+    }
+}
+
+/**
+ * Fetch voting events using enhanced detection
  * @param {number} fromBlock Starting block
  * @param {number} toBlock Ending block
- * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
+ * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress] 
  * @param {string} primaryRpc Primary RPC endpoint
  * @param {string} fallbackRpc Fallback RPC endpoint
  * @param {boolean} isInitialFetch Whether this is the initial historical fetch
@@ -53,375 +305,16 @@ export async function fetchVotingEvents(fromBlock, toBlock, addresses, primaryRp
     const batchSize = isInitialFetch ? INITIAL_FETCH_BATCH_SIZE : LIVE_FETCH_BATCH_SIZE;
     console.log(`Fetching voting transactions from block ${fromBlock} to ${toBlock} (${isInitialFetch ? 'initial' : 'live'} mode)`);
     
-    // Defaulting to block scanning method (trace_filter disabled)
-    return await fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize);
-}
-
-/**
- * Check if the primary node has the block data
- * @param {number} blockNumber Block to check
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<{hasBlock: boolean, useArchive: boolean}>} Result of check
- */
-export async function checkBlockAvailability(blockNumber, primaryRpc, fallbackRpc) {
-    return await retry(async () => {
-        try {
-            console.log(`Checking if block ${blockNumber} is available on primary node...`);
-            
-            // Try primary provider
-            try {
-                const provider = new ethers.JsonRpcProvider(primaryRpc);
-                
-                // Set timeout for block check
-                const blockPromise = provider.getBlock(blockNumber);
-                const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Block availability check timed out')), 10000);
-                });
-                
-                const block = await Promise.race([blockPromise, timeoutPromise]);
-                
-                if (block) {
-                    console.log(`Block ${blockNumber} is available on primary node`);
-                    // Add to cache
-                    blockCache.set(blockNumber, block);
-                    return { hasBlock: true, useArchive: false };
-                }
-            } catch (error) {
-                console.log(`Primary node failed for block check: ${error.message}`);
-            }
-            
-            // Try archive provider
-            try {
-                const provider = new ethers.JsonRpcProvider(fallbackRpc);
-                
-                // Set timeout for block check
-                const blockPromise = provider.getBlock(blockNumber);
-                const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Block availability check timed out')), 10000);
-                });
-                
-                const block = await Promise.race([blockPromise, timeoutPromise]);
-                
-                if (block) {
-                    console.log(`Block ${blockNumber} is available on archive node`);
-                    // Add to cache
-                    blockCache.set(blockNumber, block);
-                    return { hasBlock: true, useArchive: true };
-                }
-            } catch (error) {
-                console.log(`Archive node also failed for block check: ${error.message}`);
-            }
-            
-            console.log(`Block ${blockNumber} not found on either node`);
-            return { hasBlock: false, useArchive: false };
-        } catch (error) {
-            console.error(`Error checking block availability: ${error.message}`);
-            return { hasBlock: false, useArchive: true }; // Default to archive on error
-        }
-    }, 3, 1000); // Retry up to 3 times with 1s initial delay
-}
-
-/**
- * Clear caches to free memory
- */
-export function clearCaches() {
-    console.log(`Clearing caches: ${blockCache.size} blocks, ${txCache.size} transactions`);
-    blockCache.clear();
-    txCache.clear();
-    // Reset statistics
-    blockCacheHits = 0;
-    blockCacheMisses = 0;
-    txCacheHits = 0;
-    txCacheMisses = 0;
-}
-
-/**
- * Limit cache sizes to prevent memory issues
- * @param {number} maxBlocks Maximum number of blocks to cache
- * @param {number} maxTxs Maximum number of transactions to cache
- */
-export function limitCacheSizes(maxBlocks = 1000, maxTxs = 5000) {
-    // If caches are already under limits, do nothing
-    if (blockCache.size <= maxBlocks && txCache.size <= maxTxs) {
-        return;
-    }
-    
-    console.log(`Limiting cache sizes to maxBlocks=${maxBlocks}, maxTxs=${maxTxs}`);
-    
-    // Limit block cache - remove oldest entries first (typically lowest block numbers)
-    if (blockCache.size > maxBlocks) {
-        const excessCount = blockCache.size - maxBlocks;
-        console.log(`Removing ${excessCount} entries from block cache`);
-        
-        // Sort keys numerically (block numbers)
-        const sortedKeys = [...blockCache.keys()].sort((a, b) => a - b);
-        
-        // Remove oldest blocks first
-        const keysToDelete = sortedKeys.slice(0, excessCount);
-        for (const key of keysToDelete) {
-            blockCache.delete(key);
-        }
-    }
-    
-    // Limit tx cache - remove oldest entries (less frequently accessed)
-    if (txCache.size > maxTxs) {
-        const excessCount = txCache.size - maxTxs;
-        console.log(`Removing ${excessCount} entries from transaction cache`);
-        
-        // Get keys (transaction hashes)
-        const keys = [...txCache.keys()];
-        
-        // Remove oldest entries (first added)
-        const keysToDelete = keys.slice(0, excessCount);
-        for (const key of keysToDelete) {
-            txCache.delete(key);
-        }
-    }
-    
-    console.log(`Cache sizes after limiting: blocks=${blockCache.size}, txs=${txCache.size}`);
-}
-
-/**
- * Get cache statistics
- * @returns {Object} Cache statistics
- */
-export function getCacheStats() {
-    const blockCacheEfficiency = blockCacheHits + blockCacheMisses > 0 
-        ? blockCacheHits / (blockCacheHits + blockCacheMisses) 
-        : 0;
-        
-    const txCacheEfficiency = txCacheHits + txCacheMisses > 0 
-        ? txCacheHits / (txCacheHits + txCacheMisses) 
-        : 0;
-    
-    return {
-        blockCache: {
-            size: blockCache.size,
-            hits: blockCacheHits,
-            misses: blockCacheMisses,
-            efficiency: blockCacheEfficiency.toFixed(2)
-        },
-        txCache: {
-            size: txCache.size,
-            hits: txCacheHits,
-            misses: txCacheMisses,
-            efficiency: txCacheEfficiency.toFixed(2)
-        }
-    };
-}
-
-/**
- * Improved error handling for RPC requests with detailed error logging
- * @param {Object} request RPC request details
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @param {number} timeout Request timeout in milliseconds
- * @returns {Promise<any>} Response data
- */
-async function makeRpcRequestWithTimeout(request, primaryRpc, fallbackRpc, timeout = 10000) {
-    const payload = {
-        jsonrpc: '2.0',
-        id: 1,
-        ...request
-    };
-    
-    // Track request metrics
-    const startTime = Date.now();
-    const requestId = Math.random().toString(36).substring(2, 10);
-    
-    try {
-        // Create a timeout promise
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`RPC request timed out after ${timeout}ms`)), timeout);
-        });
-        
-        // Create the actual request promise
-        const requestPromise = axios.post(primaryRpc, payload, {
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        });
-        
-        // Race between the request and the timeout
-        const response = await Promise.race([requestPromise, timeoutPromise]);
-        
-        // Calculate response time
-        const responseTime = Date.now() - startTime;
-        
-        // Log detailed metrics for slow responses
-        if (responseTime > 1000) {
-            console.log(`Slow RPC response [${requestId}]: ${responseTime}ms method=${request.method} params=${JSON.stringify(request.params)}`);
-        }
-        
-        if (response.data.error) {
-            throw new Error(`RPC error: ${response.data.error.message || JSON.stringify(response.data.error)}`);
-        }
-        
-        return response.data.result;
-    } catch (primaryError) {
-        // Detailed error logging
-        let errorType = 'unknown';
-        if (primaryError.code === 'ECONNABORTED' || primaryError.message.includes('timeout')) {
-            errorType = 'timeout';
-        } else if (primaryError.response) {
-            errorType = `http_${primaryError.response.status}`;
-        } else if (primaryError.request) {
-            errorType = 'no_response';
-        } else if (primaryError.message.includes('RPC error')) {
-            errorType = 'rpc_error';
-        }
-        
-        console.log(`Primary RPC error [${requestId}]: ${errorType} - ${primaryError.message}`);
-        console.log(`Trying fallback RPC for request [${requestId}]...`);
-        
-        try {
-            // Create a new timeout promise for fallback
-            const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error(`Fallback RPC request timed out after ${timeout}ms`)), timeout);
-            });
-            
-            // Create the fallback request promise
-            const requestPromise = axios.post(fallbackRpc, payload, {
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            });
-            
-            // Race between the fallback request and the timeout
-            const response = await Promise.race([requestPromise, timeoutPromise]);
-            
-            // Calculate response time for fallback
-            const fallbackResponseTime = Date.now() - startTime;
-            console.log(`Fallback RPC response [${requestId}]: ${fallbackResponseTime}ms`);
-            
-            if (response.data.error) {
-                throw new Error(`Fallback RPC error: ${response.data.error.message || JSON.stringify(response.data.error)}`);
-            }
-            
-            return response.data.result;
-        } catch (fallbackError) {
-            // Log detailed fallback error
-            let fallbackErrorType = 'unknown';
-            if (fallbackError.code === 'ECONNABORTED' || fallbackError.message.includes('timeout')) {
-                fallbackErrorType = 'timeout';
-            } else if (fallbackError.response) {
-                fallbackErrorType = `http_${fallbackError.response.status}`;
-            } else if (fallbackError.request) {
-                fallbackErrorType = 'no_response';
-            } else if (fallbackError.message.includes('RPC error')) {
-                fallbackErrorType = 'rpc_error';
-            }
-            
-            console.error(`Fallback RPC also failed [${requestId}]: ${fallbackErrorType} - ${fallbackError.message}`);
-            
-            // Enhanced error for better debugging
-            const enhancedError = new Error(`Both primary and fallback RPC requests failed: ${primaryError.message} | ${fallbackError.message}`);
-            enhancedError.primaryError = primaryError;
-            enhancedError.fallbackError = fallbackError;
-            enhancedError.requestData = {
-                method: request.method,
-                params: request.params
-            };
-            
-            throw enhancedError;
-        }
-    }
-}
-
-/*
- // Commented Out: Fetch voting events using trace_filter with optimized batching
-async function fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize) {
-    const proxyAddress = ethers.getAddress(addresses[0].toLowerCase());
-    const implAddress = ethers.getAddress(addresses[1].toLowerCase());
-    
-    let allResults = [];
-    let activePromises = [];
-    let processedResults = 0;
-    
-    // Create batches
-    const batches = [];
-    for (let start = fromBlock; start <= toBlock; start += batchSize) {
-        const end = Math.min(start + batchSize - 1, toBlock);
-        batches.push({ start, end });
-    }
-    
-    console.log(`Processing ${batches.length} batches...`);
-    const totalBatches = batches.length;
-    
-    // Process batches with concurrency control
-    for (let i = 0; i < batches.length; i++) {
-        const { start, end } = batches[i];
-        
-        // Create a promise for this batch
-        const batchPromise = (async () => {
-            try {
-                const batchResults = await processSingleBatchWithTraceFilter(
-                    start, end, proxyAddress, implAddress, primaryRpc, fallbackRpc
-                );
-                
-                processedResults++;
-                if (processedResults % 5 === 0 || processedResults === totalBatches) {
-                    console.log(`Processed ${processedResults}/${totalBatches} batches (${Math.round(processedResults/totalBatches*100)}%)`);
-                }
-                
-                return batchResults;
-            } catch (error) {
-                console.error(`Error processing batch ${start}-${end}:`, error.message);
-                return []; // Return empty array on error to continue processing
-            }
-        })();
-        
-        activePromises.push(batchPromise);
-        
-        // Wait for some promises to complete if we hit concurrency limit
-        if (activePromises.length >= MAX_CONCURRENT_BATCHES || i === batches.length - 1) {
-            const batchResults = await Promise.all(activePromises);
-            
-            // Flatten and add to results
-            for (const results of batchResults) {
-                allResults = allResults.concat(results);
-            }
-            
-            // Reset active promises
-            activePromises = [];
-            
-            // Throttle to avoid overwhelming the node
-            await sleep(REQUEST_THROTTLE_MS);
-        }
-    }
-    
-    console.log(`Found ${allResults.length} voting transactions with trace_filter`);
-    return allResults;
-}
-*/
-
-/**
- * Fallback method using block scanning with optimized batching
- * @param {number} fromBlock Starting block
- * @param {number} toBlock Ending block
- * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @param {number} batchSize Size of each block batch
- * @returns {Promise<Array>} Array of voting events
- */
-async function fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize) {
-    const proxyAddress = ethers.getAddress(addresses[0].toLowerCase());
-    
-    // Create provider
+    // Create provider (fail over if needed)
     let provider;
     try {
         provider = new ethers.JsonRpcProvider(primaryRpc);
+        await provider.getBlockNumber(); // Test connection
     } catch (error) {
         console.log(`Primary RPC failed: ${error.message}`);
         provider = new ethers.JsonRpcProvider(fallbackRpc);
     }
     
-    let allResults = [];
-    let activePromises = [];
-    let processedResults = 0;
-    
     // Create batches
     const batches = [];
     for (let start = fromBlock; start <= toBlock; start += batchSize) {
@@ -429,173 +322,67 @@ async function fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRp
         batches.push({ start, end });
     }
     
-    console.log(`Processing ${batches.length} block scan batches...`);
-    const totalBatches = batches.length;
+    console.log(`Processing ${batches.length} batches of ${batchSize} blocks each`);
     
-    // Process batches with concurrency control
-    for (let i = 0; i < batches.length; i++) {
-        const { start, end } = batches[i];
+    // Process batches with controlled concurrency
+    const allVotes = new Map(); // Use Map to ensure unique votes by hash
+    let processedBatches = 0;
+    
+    // Process batches with limited concurrency
+    for (let i = 0; i < batches.length; i += MAX_CONCURRENT_BATCHES) {
+        const currentBatches = batches.slice(i, i + MAX_CONCURRENT_BATCHES);
         
-        // Create a promise for this batch
-        const batchPromise = (async () => {
-            try {
-                const batchResults = await processSingleBatchWithBlockScan(
-                    start, end, proxyAddress, provider
-                );
+        // Process each batch in parallel
+        const batchPromises = currentBatches.map(async ({ start, end }) => {
+            const batchVotes = [];
+            
+            // Process blocks in smaller sub-batches
+            const SUB_BATCH_SIZE = 20;
+            for (let blockNum = start; blockNum <= end; blockNum += SUB_BATCH_SIZE) {
+                const subEnd = Math.min(blockNum + SUB_BATCH_SIZE - 1, end);
                 
-                processedResults++;
-                if (processedResults % 5 === 0 || processedResults === totalBatches) {
-                    console.log(`Processed ${processedResults}/${totalBatches} block scan batches (${Math.round(processedResults/totalBatches*100)}%)`);
+                // Process each block in the sub-batch
+                for (let currentBlock = blockNum; currentBlock <= subEnd; currentBlock++) {
+                    const blockVotes = await processBlockForVotes(currentBlock, provider);
+                    batchVotes.push(...blockVotes);
                 }
                 
-                return batchResults;
-            } catch (error) {
-                console.error(`Error processing block scan batch ${start}-${end}:`, error.message);
-                return []; // Return empty array on error to continue processing
-            }
-        })();
-        
-        activePromises.push(batchPromise);
-        
-        // Wait for some promises to complete if we hit concurrency limit
-        if (activePromises.length >= MAX_CONCURRENT_BATCHES || i === batches.length - 1) {
-            const batchResults = await Promise.all(activePromises);
-            
-            // Flatten and add to results
-            for (const results of batchResults) {
-                allResults = allResults.concat(results);
+                // Brief pause between sub-batches
+                if (blockNum + SUB_BATCH_SIZE <= end) {
+                    await sleep(10);
+                }
             }
             
-            // Reset active promises
-            activePromises = [];
-            
-            // Throttle to avoid overwhelming the node
+            return batchVotes;
+        });
+        
+        // Wait for current batch to complete
+        const batchResults = await Promise.all(batchPromises);
+        
+        // Add votes to the Map
+        for (const votes of batchResults) {
+            for (const vote of votes) {
+                allVotes.set(vote.transactionHash, vote);
+            }
+        }
+        
+        // Update progress
+        processedBatches += currentBatches.length;
+        const progress = Math.round((processedBatches / batches.length) * 100);
+        console.log(`Progress: ${progress}% (${processedBatches}/${batches.length} batches, ${allVotes.size} votes found)`);
+        
+        // Brief pause between batch groups
+        if (i + MAX_CONCURRENT_BATCHES < batches.length) {
             await sleep(REQUEST_THROTTLE_MS);
         }
     }
     
-    console.log(`Found ${allResults.length} voting transactions with block scanning`);
-    return allResults;
+    // Convert votes Map to Array
+    return Array.from(allVotes.values());
 }
 
 /**
- * Process a single batch with block scanning
- * @param {number} fromBlock Starting block
- * @param {number} toBlock Ending block
- * @param {string} proxyAddress Proxy contract address
- * @param {ethers.Provider} provider Ethers provider
- * @returns {Promise<Array>} Array of processed transactions
- */
-async function processSingleBatchWithBlockScan(fromBlock, toBlock, proxyAddress, provider) {
-    const results = [];
-    
-    // Process in smaller sub-batches to avoid overwhelming the node
-    const SUB_BATCH_SIZE = 10;
-    
-    for (let currentBlock = fromBlock; currentBlock <= toBlock; currentBlock += SUB_BATCH_SIZE) {
-        const endBlock = Math.min(currentBlock + SUB_BATCH_SIZE - 1, toBlock);
-        
-        // Get blocks in parallel
-        const blockPromises = [];
-        for (let blockNum = currentBlock; blockNum <= endBlock; blockNum++) {
-            // Check cache first
-            if (blockCache.has(blockNum)) {
-                blockCacheHits++;
-                blockPromises.push(Promise.resolve(blockCache.get(blockNum)));
-            } else {
-                blockCacheMisses++;
-                blockPromises.push(
-                    (async () => {
-                        try {
-                            // Set up timeout for block retrieval
-                            const timeoutPromise = new Promise((_, reject) => {
-                                setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNum}`)), 10000);
-                            });
-                            
-                            const blockPromise = provider.getBlock(blockNum, true);
-                            const block = await Promise.race([blockPromise, timeoutPromise]);
-                            
-                            if (block) {
-                                blockCache.set(blockNum, block);
-                            }
-                            return block;
-                        } catch (error) {
-                            console.error(`Error getting block ${blockNum}:`, error.message);
-                            return null;
-                        }
-                    })()
-                );
-            }
-        }
-        
-        const blocks = await Promise.all(blockPromises);
-        
-        // Process blocks and find transactions to proxy
-        for (const block of blocks) {
-            if (!block || !block.transactions) continue;
-            
-            // Filter for transactions that might be votes
-            const potentialVoteTxs = block.transactions.filter(tx => 
-                typeof tx === 'object' && tx.to && 
-                tx.to.toLowerCase() === proxyAddress.toLowerCase() && 
-                tx.value > 0n
-            );
-            
-            // Process each potential vote transaction
-            for (const tx of potentialVoteTxs) {
-                try {
-                    // Check if in cache first
-                    if (txCache.has(tx.hash)) {
-                        txCacheHits++;
-                        const cached = txCache.get(tx.hash);
-                        if (cached.success) {
-                            results.push(cached);
-                        }
-                        continue;
-                    }
-                    
-                    txCacheMisses++;
-                    
-                    // Check receipt status with timeout
-                    const timeoutPromise = new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error(`Receipt retrieval timed out for tx ${tx.hash}`)), 10000);
-                    });
-                    
-                    const receiptPromise = provider.getTransactionReceipt(tx.hash);
-                    const receipt = await Promise.race([receiptPromise, timeoutPromise]);
-                    
-                    if (receipt && receipt.status) {
-                        const result = {
-                            transactionHash: tx.hash,
-                            blockNumber: Number(block.number),
-                            from: tx.from,
-                            to: tx.to,
-                            value: Number(tx.value), // Convert BigInt to Number
-                            voteAmount: Number(ethers.formatEther(tx.value)), // Convert to SEI amount
-                            timestamp: new Date(Number(block.timestamp) * 1000),
-                            success: true,
-                            isVotingTransaction: true
-                        };
-                        
-                        // Cache the result
-                        txCache.set(tx.hash, result);
-                        results.push(result);
-                    }
-                } catch (txError) {
-                    console.error(`Error processing tx ${tx.hash}:`, txError.message);
-                }
-            }
-        }
-        
-        // Add a small delay between sub-batches
-        await sleep(10);
-    }
-    
-    return results;
-}
-
-/**
- * Listen for new votes in real-time
+ * Listen for new votes in real-time with enhanced recovery
  * @param {number} fromBlock Block to start listening from
  * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
  * @param {string} primaryRpc Primary RPC endpoint
@@ -608,144 +395,139 @@ export function listenForVotes(fromBlock, addresses, primaryRpc, fallbackRpc, ca
     let currentBlock = fromBlock;
     let provider;
     let reconnectAttempts = 0;
-    const MAX_RECONNECT_ATTEMPTS = 5;
+    let pollInterval = null;
+    const MAX_RECONNECT_ATTEMPTS = 10;
     
-    // Try to connect using WebSocket first for more efficient real-time updates
-    const connectWebSocket = () => {
-        try {
-            // Use the correct WebSocket URL (don't attempt to convert from HTTP URL)
-            const wsUrl = 'wss://evm-ws.sei.basementnodes.ca';
-            console.log(`Attempting WebSocket connection to ${wsUrl}...`);
-            
-            provider = new ethers.WebSocketProvider(wsUrl);
-            
-            // Set up event handlers
-            provider._websocket.on('open', () => {
-                console.log('WebSocket connection established');
-                reconnectAttempts = 0;
-            });
-            
-            provider._websocket.on('error', (error) => {
-                console.error('WebSocket error:', error.message);
-            });
-            
-            provider._websocket.on('close', (code, reason) => {
-                console.log(`WebSocket connection closed: ${code} - ${reason}`);
-                if (running && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                    reconnectAttempts++;
-                    console.log(`Attempting to reconnect (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-                    setTimeout(connectWebSocket, 5000 * Math.pow(2, reconnectAttempts - 1)); // Exponential backoff
-                } else if (running) {
-                    console.log('Max reconnect attempts reached, falling back to polling');
-                    fallbackToPolling();
-                }
-            });
-            
-            // Subscribe to new blocks
-            provider.on('block', async (blockNumber) => {
-                try {
-                    if (blockNumber > currentBlock) {
-                        console.log(`New block detected: ${blockNumber}`);
-                        
-                        // Fetch votes
-                        const newVotes = await fetchVotingEvents(
-                            currentBlock + 1,
-                            blockNumber,
-                            addresses,
-                            primaryRpc,
-                            fallbackRpc,
-                            false // Live mode
-                        );
-                        
-                        // Process each vote
-                        for (const vote of newVotes) {
-                            callback(vote);
-                        }
-                        
-                        // Update current block
-                        currentBlock = blockNumber;
-                    }
-                } catch (error) {
-                    console.error('Error processing new block:', error);
-                }
-            });
-            
-            return true;
-        } catch (error) {
-            console.log(`WebSocket connection failed: ${error.message}`);
-            return false;
-        }
-    };
-    
-    // Fall back to polling if WebSocket fails
-    const fallbackToPolling = () => {
+    // Polling method for vote monitoring
+    const setupPolling = () => {
         console.log('Using polling method for vote monitoring');
-        provider = new ethers.JsonRpcProvider(primaryRpc);
+        
+        // Create a provider for polling
+        const getPollingProvider = () => {
+            try {
+                return new ethers.JsonRpcProvider(primaryRpc);
+            } catch (error) {
+                console.error('Error creating primary provider:', error.message);
+                return new ethers.JsonRpcProvider(fallbackRpc);
+            }
+        };
+        
+        provider = getPollingProvider();
         
         // Start polling loop
-        const pollInterval = async () => {
+        const pollForVotes = async () => {
+            if (!running) return;
+            
             try {
-                if (!running) return;
-                
-                const latestBlock = await provider.getBlockNumber();
+                let latestBlock;
+                try {
+                    latestBlock = await provider.getBlockNumber();
+                } catch (error) {
+                    console.error('Error getting block number, recreating provider:', error.message);
+                    provider = getPollingProvider();
+                    latestBlock = await provider.getBlockNumber();
+                }
                 
                 // Check if we have new blocks to process
                 if (latestBlock > currentBlock) {
-                    console.log(`Checking for new votes in blocks ${currentBlock + 1} to ${latestBlock}`);
+                    // Don't process too many blocks at once to avoid timeouts
+                    const batchEndBlock = Math.min(latestBlock, currentBlock + LIVE_FETCH_BATCH_SIZE);
                     
-                    // Fetch votes
+                    console.log(`Checking for new votes in blocks ${currentBlock + 1} to ${batchEndBlock}`);
+                    
+                    // Fetch votes using our enhanced method
                     const newVotes = await fetchVotingEvents(
                         currentBlock + 1,
-                        latestBlock,
+                        batchEndBlock,
                         addresses,
                         primaryRpc,
                         fallbackRpc,
-                        false // Live mode
+                        false // Not initial fetch
                     );
                     
-                    // Process each vote
-                    for (const vote of newVotes) {
-                        callback(vote);
+                    // Process each vote through callback
+                    if (newVotes.length > 0) {
+                        console.log(`Found ${newVotes.length} new votes!`);
+                        
+                        for (const vote of newVotes) {
+                            callback(vote);
+                        }
                     }
                     
-                    // Update current block
-                    currentBlock = latestBlock;
+                    // Update current block, even if we found no votes
+                    currentBlock = batchEndBlock;
+                    console.log(`Updated current block to ${currentBlock}`);
                 }
                 
+                // Reset reconnect attempts on success
+                reconnectAttempts = 0;
+                
                 // Schedule next poll
-                setTimeout(pollInterval, 2000); // Poll every 2 seconds
+                pollInterval = setTimeout(pollForVotes, 5000); // Poll every 5 seconds
             } catch (error) {
                 console.error('Error in vote polling:', error);
+                
                 // Try again after a short delay with exponential backoff
-                const delay = Math.min(30000, 2000 * Math.pow(2, reconnectAttempts));
                 reconnectAttempts++;
-                console.log(`Retrying in ${delay/1000} seconds (attempt ${reconnectAttempts})...`);
-                setTimeout(pollInterval, delay);
+                const delay = Math.min(60000, 5000 * Math.pow(1.5, reconnectAttempts));
+                console.log(`Polling failed. Retrying in ${Math.round(delay/1000)} seconds (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                
+                if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                    console.error(`Reached maximum reconnect attempts (${MAX_RECONNECT_ATTEMPTS}). Resetting attempts and recreating provider.`);
+                    reconnectAttempts = 0;
+                    provider = getPollingProvider();
+                }
+                
+                pollInterval = setTimeout(pollForVotes, delay);
             }
         };
         
         // Start initial poll
-        pollInterval();
+        console.log(`Starting polling from block ${currentBlock}`);
+        pollForVotes();
     };
     
-    // First try WebSocket, fall back to polling if it fails
-    const wsSuccess = connectWebSocket();
-    if (!wsSuccess) {
-        fallbackToPolling();
-    }
+    // Start with polling (more reliable)
+    setupPolling();
     
     // Return control object
     return {
         stop: () => {
+            console.log('Stopping vote listener');
             running = false;
-            if (provider) {
-                if (provider instanceof ethers.WebSocketProvider && provider._websocket) {
-                    provider._websocket.close();
-                } else if (typeof provider.destroy === 'function') {
-                    provider.destroy();
-                }
+            
+            if (pollInterval) {
+                clearTimeout(pollInterval);
+                pollInterval = null;
             }
-        }
+            
+            if (provider && typeof provider.destroy === 'function') {
+                provider.destroy();
+            }
+        },
+        getCurrentBlock: () => currentBlock
+    };
+}
+
+/**
+ * Clear caches to free memory
+ */
+export function clearCaches() {
+    console.log(`Clearing caches: ${blockCache.size()} blocks, ${txCache.size()} transactions, ${receiptCache.size()} receipts`);
+    blockCache.clear();
+    txCache.clear();
+    receiptCache.clear();
+}
+
+/**
+ * Get cache statistics
+ * @returns {Object} Cache statistics
+ */
+export function getCacheStats() {
+    return {
+        blockCache: blockCache.getStats(),
+        txCache: txCache.getStats(),
+        receiptCache: receiptCache.getStats()
     };
 }
 
@@ -760,11 +542,8 @@ export function listenForVotes(fromBlock, addresses, primaryRpc, fallbackRpc, ca
 export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, addresses = []) {
     // Check cache first
     if (txCache.has(txHash)) {
-        txCacheHits++;
         return txCache.get(txHash);
     }
-    
-    txCacheMisses++;
     
     return await retry(async () => {
         let provider;
@@ -777,13 +556,12 @@ export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, add
         }
         
         try {
-            // Set timeout for transaction retrieval
+            // Get transaction with timeout
             const txPromise = provider.getTransaction(txHash);
             const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error(`Transaction retrieval timed out for ${txHash}`)), 10000);
+                setTimeout(() => reject(new Error(`Transaction retrieval timed out for ${txHash}`)), 15000);
             });
             
-            // Get transaction data with timeout
             const tx = await Promise.race([txPromise, timeoutPromise]);
             
             if (!tx) {
@@ -796,7 +574,7 @@ export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, add
             const receipt = await Promise.race([
                 receiptPromise,
                 new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error(`Receipt retrieval timed out for ${txHash}`)), 10000);
+                    setTimeout(() => reject(new Error(`Receipt retrieval timed out for ${txHash}`)), 15000);
                 })
             ]);
             
@@ -810,16 +588,14 @@ export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, add
             let block;
             
             if (blockCache.has(blockNumber)) {
-                blockCacheHits++;
                 block = blockCache.get(blockNumber);
             } else {
-                blockCacheMisses++;
                 const blockPromise = provider.getBlock(blockNumber);
                 
                 block = await Promise.race([
                     blockPromise,
                     new Promise((_, reject) => {
-                        setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNumber}`)), 10000);
+                        setTimeout(() => reject(new Error(`Block retrieval timed out for block ${blockNumber}`)), 15000);
                     })
                 ]);
                 
@@ -833,23 +609,22 @@ export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, add
                 return null;
             }
             
-            // Check if this is a voting transaction (if addresses are provided)
-            let isVotingTransaction = true;
-            if (addresses.length > 0) {
-                const proxyAddress = addresses[0].toLowerCase();
-                isVotingTransaction = tx.to && tx.to.toLowerCase() === proxyAddress && tx.value > 0n;
-            }
+            // Check if this is a voting transaction using our enhanced detection
+            const voteCheck = isVoteTransaction(tx, receipt);
             
             const details = {
                 hash: tx.hash,
                 blockNumber: blockNumber,
                 from: tx.from,
                 to: tx.to,
-                value: Number(tx.value), // Convert BigInt to Number
-                voteAmount: Number(ethers.formatEther(tx.value)), // Convert to SEI amount
+                value: Number(ethers.formatEther(tx.value)),
+                voteAmount: Number(ethers.formatEther(tx.value)),
                 timestamp: new Date(Number(block.timestamp) * 1000),
                 success: receipt.status === 1,
-                isVotingTransaction
+                isVotingTransaction: voteCheck.isVote,
+                detectionMethod: voteCheck.detectionMethod,
+                gasUsed: Number(receipt.gasUsed),
+                logs: receipt.logs.length
             };
             
             // Cache the result
@@ -860,5 +635,5 @@ export async function getTransactionDetails(txHash, primaryRpc, fallbackRpc, add
             console.error(`Error getting transaction details for ${txHash}:`, error.message);
             return null;
         }
-    }, 3, 1000); // Retry up to 3 times with 1s initial delay
+    }, 3, 1000);
 }
