@@ -53,14 +53,8 @@ export async function fetchVotingEvents(fromBlock, toBlock, addresses, primaryRp
     const batchSize = isInitialFetch ? INITIAL_FETCH_BATCH_SIZE : LIVE_FETCH_BATCH_SIZE;
     console.log(`Fetching voting transactions from block ${fromBlock} to ${toBlock} (${isInitialFetch ? 'initial' : 'live'} mode)`);
     
-    // Try trace_filter first (most efficient)
-    try {
-        return await fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize);
-    } catch (error) {
-        console.log(`trace_filter failed: ${error.message}`);
-        console.log('Falling back to block scanning method');
-        return await fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize);
-    }
+    // Defaulting to block scanning method (trace_filter disabled)
+    return await fetchVotingWithBlockScan(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize);
 }
 
 /**
@@ -335,16 +329,8 @@ async function makeRpcRequestWithTimeout(request, primaryRpc, fallbackRpc, timeo
     }
 }
 
-/**
- * Fetch voting events using trace_filter with optimized batching
- * @param {number} fromBlock Starting block
- * @param {number} toBlock Ending block
- * @param {Array<string>} addresses Addresses to monitor [proxyAddress, implAddress]
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @param {number} batchSize Size of each block batch
- * @returns {Promise<Array>} Array of voting events
- */
+/*
+ // Commented Out: Fetch voting events using trace_filter with optimized batching
 async function fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primaryRpc, fallbackRpc, batchSize) {
     const proxyAddress = ethers.getAddress(addresses[0].toLowerCase());
     const implAddress = ethers.getAddress(addresses[1].toLowerCase());
@@ -408,200 +394,7 @@ async function fetchVotingWithTraceFilter(fromBlock, toBlock, addresses, primary
     console.log(`Found ${allResults.length} voting transactions with trace_filter`);
     return allResults;
 }
-
-/**
- * Process a single batch with trace_filter
- * @param {number} fromBlock Starting block
- * @param {number} toBlock Ending block
- * @param {string} proxyAddress Proxy contract address
- * @param {string} implAddress Implementation contract address
- * @param {string} primaryRpc Primary RPC endpoint
- * @param {string} fallbackRpc Fallback RPC endpoint
- * @returns {Promise<Array>} Array of processed transactions
- */
-async function processSingleBatchWithTraceFilter(fromBlock, toBlock, proxyAddress, implAddress, primaryRpc, fallbackRpc) {
-    // Track request metrics
-    const startTime = Date.now();
-    const requestId = Math.random().toString(36).substring(2, 10);
-    
-    const traceFilterPayload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "trace_filter",
-        params: [{
-            fromBlock: `0x${fromBlock.toString(16)}`,
-            toBlock: `0x${toBlock.toString(16)}`,
-            fromAddress: [proxyAddress],
-            toAddress: [implAddress],
-            after: 0,
-            count: 10000
-        }]
-    };
-    
-    let response, rpcUrl;
-    
-    try {
-        // Create a timeout promise
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`RPC request timed out after 30s`)), 30000);
-        });
-        
-        // Create the actual request promise
-        const requestPromise = axios.post(primaryRpc, traceFilterPayload, {
-            headers: { 'Content-Type': 'application/json' }
-        });
-        
-        // Try primary RPC first with timeout
-        rpcUrl = primaryRpc;
-        response = await Promise.race([requestPromise, timeoutPromise]);
-        
-        // Log slow responses
-        const responseTime = Date.now() - startTime;
-        if (responseTime > 5000) {
-            console.log(`Slow trace_filter response [${requestId}]: ${responseTime}ms for blocks ${fromBlock}-${toBlock}`);
-        }
-    } catch (error) {
-        // More detailed error logging
-        let errorType = 'unknown';
-        if (error.code === 'ECONNABORTED' || error.message.includes('timed out')) {
-            errorType = 'timeout';
-        } else if (error.response) {
-            errorType = `http_${error.response.status}`;
-        } else if (error.request) {
-            errorType = 'no_response';
-        }
-        
-        console.log(`Primary RPC failed for batch ${fromBlock}-${toBlock} [${requestId}]: ${errorType} - ${error.message}`);
-        console.log('Trying fallback RPC...');
-        
-        // Try fallback RPC with timeout
-        rpcUrl = fallbackRpc;
-        
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Fallback RPC request timed out after 30s`)), 30000);
-        });
-        
-        const requestPromise = axios.post(fallbackRpc, traceFilterPayload, {
-            headers: { 'Content-Type': 'application/json' }
-        });
-        
-        response = await Promise.race([requestPromise, timeoutPromise]);
-    }
-    
-    if (response.data.error) {
-        throw new Error(`RPC error: ${response.data.error.message}`);
-    }
-    
-    // Get traces from the response
-    const traces = response.data.result;
-    if (!traces || traces.length === 0) {
-        return [];
-    }
-    
-    // Group traces by transaction hash to reduce RPC calls
-    const tracesByTx = {};
-    traces.forEach(trace => {
-        if (!tracesByTx[trace.transactionHash]) {
-            tracesByTx[trace.transactionHash] = [];
-        }
-        tracesByTx[trace.transactionHash].push(trace);
-    });
-    
-    // Process all unique transactions
-    const provider = new ethers.JsonRpcProvider(rpcUrl);
-    const results = [];
-    
-    // Process in smaller batches to avoid overwhelming the provider
-    const txHashes = Object.keys(tracesByTx);
-    const TX_BATCH_SIZE = 10;
-    
-    for (let i = 0; i < txHashes.length; i += TX_BATCH_SIZE) {
-        const batchTxHashes = txHashes.slice(i, i + TX_BATCH_SIZE);
-        const txPromises = batchTxHashes.map(async (txHash) => {
-            try {
-                // Check cache first
-                if (txCache.has(txHash)) {
-                    txCacheHits++;
-                    const cached = txCache.get(txHash);
-                    return {
-                        ...cached,
-                        traces: tracesByTx[txHash]
-                    };
-                }
-                
-                txCacheMisses++;
-                
-                // Get transaction
-                const tx = await provider.getTransaction(txHash);
-                if (!tx) return null;
-                
-                // Get block for timestamp if not cached
-                let block;
-                const blockNumber = Number(tx.blockNumber);
-                if (blockCache.has(blockNumber)) {
-                    blockCacheHits++;
-                    block = blockCache.get(blockNumber);
-                } else {
-                    blockCacheMisses++;
-                    block = await provider.getBlock(blockNumber);
-                    if (block) {
-                        blockCache.set(blockNumber, block);
-                    }
-                }
-                
-                if (!block) return null;
-                
-                // Save the processed transaction to cache
-                const processedTx = {
-                    transactionHash: txHash,
-                    blockNumber: blockNumber,
-                    from: tx.from,
-                    to: tx.to,
-                    timestamp: new Date(Number(block.timestamp) * 1000),
-                    success: true,
-                    isVotingTransaction: true,
-                    traces: tracesByTx[txHash]
-                };
-                
-                txCache.set(txHash, processedTx);
-                return processedTx;
-            } catch (error) {
-                console.error(`Error processing transaction ${txHash}:`, error.message);
-                return null;
-            }
-        });
-        
-        const processedTxs = await Promise.all(txPromises);
-        
-        // Extract values from traces and add to results
-        for (const tx of processedTxs) {
-            if (!tx) continue;
-            
-            // Calculate total vote amount from all traces
-            let voteAmount = 0n;
-            for (const trace of tx.traces) {
-                voteAmount += BigInt(trace.action.value);
-            }
-            
-            results.push({
-                transactionHash: tx.transactionHash,
-                blockNumber: tx.blockNumber,
-                from: tx.from,
-                to: tx.to,
-                value: Number(voteAmount), // Convert BigInt to Number
-                voteAmount: Number(ethers.formatEther(voteAmount)), // Convert to SEI amount
-                timestamp: tx.timestamp,
-                success: tx.success,
-                isVotingTransaction: tx.isVotingTransaction
-            });
-        }
-        
-        // Add a small delay between tx batches
-        await sleep(10);
-    }
-    
-    return results;
-}
+*/
 
 /**
  * Fallback method using block scanning with optimized batching
