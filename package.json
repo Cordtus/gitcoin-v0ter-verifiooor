@@ -1,15 +1,17 @@
 {
   "name": "sei-voting-monitor",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Monitor voting activity on SEI blockchain and track wallet balances",
   "main": "index.js",
   "type": "module",
-    "scripts": {
-  "start": "node index.js",
-  "analyze": "node contractReader.js",
-  "report": "node generateReport.js",
-  "test": "echo \"Error: no test specified\" && exit 1"
-},
+  "scripts": {
+    "start": "node index.js",
+    "analyze": "node contractReader.js",
+    "report": "node generateReport.js",
+    "convert:dectohex": "node scripts/dectohex.js",
+    "convert:hextodec": "node scripts/hextodec.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "keywords": [
     "sei",
     "blockchain",
@@ -25,7 +27,6 @@
     "sei-logs-wrapper": "^1.1.1"
   },
   "devDependencies": {
-  "jest": "^29.5.0",
-  "eslint": "^8.38.0"
- }
+    "eslint": "^8.38.0"
+  }
 }

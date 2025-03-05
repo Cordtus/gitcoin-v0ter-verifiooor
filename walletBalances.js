@@ -3,16 +3,25 @@
 import { ethers } from 'ethers';
 import axios from 'axios';
 import fs from 'fs';
+import { retry, sleep } from './utils.js';
 
 // Constants
 const USEI_TO_SEI = 1000000; // 1 SEI = 1,000,000 uSEI
 const WEI_DECIMALS = 18;     // 1 SEI = 10^18 wei (asei)
 const DISPLAY_DECIMALS = 6;  // Keep 6 decimal places for display
 const WALLET_CONVERTER_API = 'https://wallets.sei.basementnodes.ca';
+const REVERSE_LOOKUP_TIMEOUT = 10000; // 10 seconds timeout for reverse lookup
 
 // In-memory cache for wallet mappings and balances
 const addressCache = new Map();
 const balanceCache = new Map();
+const reverseAddressCache = new Map(); // New cache for cosmos->evm lookups
+
+// Cache statistics for adaptive management
+let addressCacheHits = 0;
+let addressCacheMisses = 0;
+let balanceCacheHits = 0;
+let balanceCacheMisses = 0;
 
 /**
  * Convert EVM address to Cosmos address
@@ -22,65 +31,176 @@ const balanceCache = new Map();
  * @returns {Promise<string>} Cosmos address
  */
 export async function convertEvmToCosmos(evmAddress, primaryRestUrl, fallbackRestUrl) {
+    // Standardize address
+    const normalizedAddr = evmAddress.toLowerCase();
+    
     // Check cache first
-    const cacheKey = evmAddress.toLowerCase();
-    if (addressCache.has(cacheKey)) {
-        return addressCache.get(cacheKey);
+    if (addressCache.has(normalizedAddr)) {
+        addressCacheHits++;
+        return addressCache.get(normalizedAddr);
     }
     
-    try {
-        const response = await axios.get(`${WALLET_CONVERTER_API}/${evmAddress}`);
-        const cosmosAddress = response.data.result;
-        
-        // Cache the result
-        addressCache.set(cacheKey, cosmosAddress);
-        
-        return cosmosAddress;
-    } catch (error) {
-        console.error(`Error converting address ${evmAddress}:`, error.message);
-        throw error;
-    }
+    addressCacheMisses++;
+    
+    return await retry(async () => {
+        try {
+            const response = await axios.get(`${WALLET_CONVERTER_API}/${normalizedAddr}`, {
+                timeout: 5000, // 5 second timeout
+                headers: {
+                    'Accept': 'application/json'
+                }
+            });
+            
+            if (response.data && response.data.result) {
+                const cosmosAddress = response.data.result;
+                
+                // Cache the result in both directions
+                addressCache.set(normalizedAddr, cosmosAddress);
+                reverseAddressCache.set(cosmosAddress, normalizedAddr);
+                
+                return cosmosAddress;
+            } else {
+                throw new Error(`Invalid response format from wallet converter API for ${normalizedAddr}`);
+            }
+        } catch (error) {
+            // More granular error handling
+            if (error.code === 'ECONNABORTED') {
+                throw new Error(`Connection timed out while converting address ${normalizedAddr}`);
+            } else if (error.response) {
+                throw new Error(`API error (${error.response.status}) converting address ${normalizedAddr}: ${error.response.data}`);
+            } else if (error.request) {
+                throw new Error(`No response received while converting address ${normalizedAddr}`);
+            } else {
+                throw new Error(`Error converting address ${normalizedAddr}: ${error.message}`);
+            }
+        }
+    }, 3, 1000); // Retry 3 times with 1s initial delay
 }
 
 /**
- * Get SEI balance for an address at a specific block height using Cosmos API
+ * Convert Cosmos address to EVM address
+ * @param {string} cosmosAddress Cosmos address
+ * @param {string} primaryRestUrl Primary REST API URL
+ * @param {string} fallbackRestUrl Fallback REST API URL
+ * @returns {Promise<string>} EVM address
+ */
+export async function convertCosmosToEvm(cosmosAddress, primaryRestUrl, fallbackRestUrl) {
+    // Check cache first
+    if (reverseAddressCache.has(cosmosAddress)) {
+        addressCacheHits++;
+        return reverseAddressCache.get(cosmosAddress);
+    }
+    
+    addressCacheMisses++;
+    
+    // Method 1: Try API for reverse lookup if available
+    try {
+        const response = await Promise.race([
+            axios.get(`${WALLET_CONVERTER_API}/reverse/${cosmosAddress}`, {
+                timeout: REVERSE_LOOKUP_TIMEOUT
+            }),
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Reverse lookup timed out')), REVERSE_LOOKUP_TIMEOUT)
+            )
+        ]);
+        
+        if (response.data && response.data.result) {
+            const evmAddress = response.data.result.toLowerCase();
+            
+            // Cache the result in both directions
+            reverseAddressCache.set(cosmosAddress, evmAddress);
+            addressCache.set(evmAddress, cosmosAddress);
+            
+            return evmAddress;
+        }
+    } catch (error) {
+        console.log(`Reverse lookup API failed for ${cosmosAddress}: ${error.message}`);
+        // Continue to fallback methods
+    }
+    
+    // Method 2: Check existing mappings
+    // Search through our existing address cache for this cosmos address
+    for (const [evm, cosmos] of addressCache.entries()) {
+        if (cosmos === cosmosAddress) {
+            reverseAddressCache.set(cosmosAddress, evm);
+            return evm;
+        }
+    }
+    
+    // Method 3: Try to find through EVM Chain query (this is more complex and depends on contract availability)
+    // This is a placeholder for an actual implementation
+    
+    // If all methods fail, we need to reject
+    throw new Error(`Could not convert Cosmos address ${cosmosAddress} to EVM address`);
+}
+
+/**
+ * Get SEI balance for an address at a specific block height
  * @param {string} cosmosAddress Cosmos address
  * @param {number} blockHeight Block height
  * @param {string} primaryRestUrl Primary REST API URL
  * @param {string} fallbackRestUrl Fallback REST API URL
+ * @param {string} primaryEvmRpc Primary EVM RPC URL 
+ * @param {string} fallbackEvmRpc Fallback EVM RPC URL
  * @returns {Promise<number>} SEI balance (with 6 decimal places)
  */
-export async function getSeiBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl) {
+export async function getSeiBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl, primaryEvmRpc, fallbackEvmRpc) {
     // Check cache first
     const cacheKey = `${cosmosAddress}-${blockHeight}`;
     if (balanceCache.has(cacheKey)) {
+        balanceCacheHits++;
         return balanceCache.get(cacheKey);
     }
     
-    try {
-        // Try getting balance using Cosmos API
-        const seiBalance = await getCosmosBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl);
+    balanceCacheMisses++;
+    
+    // Create array of methods to try
+    const balanceMethods = [
+        // Method 1: Cosmos API
+        async () => {
+            try {
+                return await getCosmosBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl);
+            } catch (error) {
+                console.error(`Cosmos balance lookup failed for ${cosmosAddress} at block ${blockHeight}: ${error.message}`);
+                throw error;
+            }
+        },
         
-        // Cache and return the result
-        balanceCache.set(cacheKey, seiBalance);
-        return seiBalance;
-    } catch (cosmosError) {
-        console.error(`Cosmos balance lookup failed: ${cosmosError.message}`);
-        
+        // Method 2: Try EVM lookup if we can convert the address
+        async () => {
+            try {
+                // Only try if address starts with 'sei'
+                if (cosmosAddress.startsWith('sei')) {
+                    const evmAddress = await convertCosmosToEvm(cosmosAddress, primaryRestUrl, fallbackRestUrl);
+                    return await getEvmBalance(evmAddress, blockHeight, primaryEvmRpc, fallbackEvmRpc);
+                } else {
+                    // If it's already an EVM address
+                    return await getEvmBalance(cosmosAddress, blockHeight, primaryEvmRpc, fallbackEvmRpc);
+                }
+            } catch (error) {
+                console.error(`EVM balance lookup failed for ${cosmosAddress} at block ${blockHeight}: ${error.message}`);
+                throw error;
+            }
+        }
+    ];
+    
+    // Try each method in sequence
+    for (const method of balanceMethods) {
         try {
-            // Fallback to EVM balance lookup
-            console.log(`Falling back to EVM balance lookup for ${cosmosAddress}`);
-            const evmBalance = await getEvmBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl);
+            const balance = await method();
             
             // Cache and return the result
-            balanceCache.set(cacheKey, evmBalance);
-            return evmBalance;
-        } catch (evmError) {
-            console.error(`EVM balance lookup also failed: ${evmError.message}`);
-            // On error, assume zero balance
-            return 0;
+            balanceCache.set(cacheKey, balance);
+            return balance;
+        } catch (error) {
+            // Continue to next method
+            continue;
         }
     }
+    
+    // If all methods fail, log and return 0
+    console.error(`All balance lookup methods failed for ${cosmosAddress} at block ${blockHeight}`);
+    return 0;
 }
 
 /**
@@ -92,85 +212,124 @@ export async function getSeiBalance(cosmosAddress, blockHeight, primaryRestUrl, 
  * @returns {Promise<number>} SEI balance (with 6 decimal places)
  */
 async function getCosmosBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl) {
-    try {
+    return await retry(async () => {
         const endpoint = `/cosmos/bank/v1beta1/balances/${cosmosAddress}/by_denom?denom=usei`;
         const headers = {
             'x-cosmos-block-height': blockHeight,
             'Accept': 'application/json'
         };
         
-        let response;
         try {
-            response = await axios.get(`${primaryRestUrl}${endpoint}`, { headers });
+            // Try primary endpoint with timeout
+            const response = await axios.get(`${primaryRestUrl}${endpoint}`, { 
+                headers,
+                timeout: 8000 // 8 second timeout
+            });
+            
+            // If the response has balance data
+            if (response.data && response.data.balance && response.data.balance.amount) {
+                // The amount will be in "usei" format (e.g., "100000000" for 100 SEI)
+                const uSeiAmount = parseInt(response.data.balance.amount);
+                const seiAmount = Number((uSeiAmount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
+                return seiAmount;
+            }
+            
+            // No balance found
+            return 0;
         } catch (primaryError) {
-            console.log(`Primary REST request failed: ${primaryError.message}`);
-            console.log(`Trying fallback REST endpoint...`);
-            response = await axios.get(`${fallbackRestUrl}${endpoint}`, { headers });
+            // More granular error handling for primary endpoint
+            if (primaryError.code === 'ECONNABORTED') {
+                console.log(`Primary REST request timed out, trying fallback...`);
+            } else if (primaryError.response) {
+                console.log(`Primary REST request failed with status ${primaryError.response.status}, trying fallback...`);
+            } else if (primaryError.request) {
+                console.log(`No response from primary REST server, trying fallback...`);
+            } else {
+                console.log(`Primary REST request error: ${primaryError.message}, trying fallback...`);
+            }
+            
+            // Try fallback with timeout
+            const response = await axios.get(`${fallbackRestUrl}${endpoint}`, { 
+                headers,
+                timeout: 8000 // 8 second timeout 
+            });
+            
+            if (response.data && response.data.balance && response.data.balance.amount) {
+                const uSeiAmount = parseInt(response.data.balance.amount);
+                const seiAmount = Number((uSeiAmount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
+                return seiAmount;
+            }
+            
+            return 0;
         }
-        
-        // If the response has balance data
-        if (response.data && response.data.balance && response.data.balance.amount) {
-            // The amount will be in "usei" format (e.g., "100000000" for 100 SEI)
-            const uSeiAmount = parseInt(response.data.balance.amount);
-            const seiAmount = Number((uSeiAmount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
-            return seiAmount;
-        }
-        
-        // No balance found
-        return 0;
-    } catch (error) {
-        console.error(`Error getting cosmos balance for ${cosmosAddress} at height ${blockHeight}:`, error.message);
-        throw error;
-    }
+    }, 3, 1000); // Retry 3 times with 1s initial delay
 }
 
 /**
  * Get SEI balance using EVM API
- * @param {string} address Address (either Cosmos or EVM)
+ * @param {string} address Address (EVM format)
  * @param {number} blockHeight Block height
  * @param {string} primaryEvmRpc Primary EVM RPC endpoint
  * @param {string} fallbackEvmRpc Fallback EVM RPC endpoint
  * @returns {Promise<number>} SEI balance (with 6 decimal places)
  */
 async function getEvmBalance(address, blockHeight, primaryEvmRpc, fallbackEvmRpc) {
-    let evmAddress = address;
-    
-    // Convert cosmos address to EVM if needed
-    if (address.startsWith('sei')) {
+    return await retry(async () => {
         try {
-            // We'd need a reverse lookup - this is a placeholder
-            // In a real implementation, you'd need a way to convert cosmos address to EVM
-            // For now, we'll just fail this path
-            throw new Error("Cosmos to EVM conversion not implemented");
-        } catch (error) {
-            console.error(`Error converting cosmos address ${address} to EVM:`, error.message);
-            throw error;
+            // Standardize address format
+            const evmAddress = ethers.getAddress(address);
+            
+            // Try primary provider with timeout wrapper
+            const provider = new ethers.JsonRpcProvider(primaryEvmRpc);
+            
+            // Set timeout for the RPC call
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('EVM RPC request timed out')), 8000)
+            );
+            
+            // Get balance with timeout
+            const balancePromise = (async () => {
+                try {
+                    const blockTag = ethers.toBeHex(blockHeight);
+                    const balanceWei = await provider.getBalance(evmAddress, blockTag);
+                    
+                    // Convert from wei to SEI with 6 decimal places
+                    const seiAmount = Number(ethers.formatUnits(balanceWei, WEI_DECIMALS));
+                    return Number(seiAmount.toFixed(DISPLAY_DECIMALS));
+                } catch (error) {
+                    throw error;
+                }
+            })();
+            
+            // Race between timeout and the actual request
+            return await Promise.race([balancePromise, timeoutPromise]);
+        } catch (primaryError) {
+            // Specific error handling for primary endpoint
+            if (primaryError.message.includes('timed out')) {
+                console.log(`Primary EVM RPC request timed out, trying fallback...`);
+            } else {
+                console.log(`Primary EVM RPC request failed: ${primaryError.message}, trying fallback...`);
+            }
+            
+            // Try fallback provider with timeout wrapper
+            const provider = new ethers.JsonRpcProvider(fallbackEvmRpc);
+            
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Fallback EVM RPC request timed out')), 8000)
+            );
+            
+            const balancePromise = (async () => {
+                const blockTag = ethers.toBeHex(blockHeight);
+                const balanceWei = await provider.getBalance(address, blockTag);
+                
+                // Convert from wei to SEI with 6 decimal places
+                const seiAmount = Number(ethers.formatUnits(balanceWei, WEI_DECIMALS));
+                return Number(seiAmount.toFixed(DISPLAY_DECIMALS));
+            })();
+            
+            return await Promise.race([balancePromise, timeoutPromise]);
         }
-    }
-    
-    try {
-        let provider;
-        try {
-            provider = new ethers.JsonRpcProvider(primaryEvmRpc);
-        } catch (error) {
-            console.log(`Primary EVM RPC failed: ${error.message}`);
-            provider = new ethers.JsonRpcProvider(fallbackEvmRpc);
-        }
-        
-        // Standardize address format
-        evmAddress = ethers.getAddress(evmAddress);
-        
-        // Get balance at specific block height
-        const blockTag = ethers.toBeHex(blockHeight);
-        const balanceWei = await provider.getBalance(evmAddress, blockTag);
-        
-        // Convert from wei to SEI with 6 decimal places
-        const seiAmount = Number(ethers.formatUnits(balanceWei, WEI_DECIMALS));
-        return Number(seiAmount.toFixed(DISPLAY_DECIMALS));
-    } catch (error) {
-        console.error(`Error getting EVM balance for ${evmAddress} at height ${blockHeight}:`, error.message);
-        throw error;
-    }
+    }, 3, 1000); // Retry 3 times with 1s initial delay
 }
 
 /**
@@ -357,37 +516,24 @@ export async function checkFinalBalances(
         }
         
         try {
-            // Try both cosmos and EVM balance methods
-            let finalBalance;
-            
-            try {
-                // First try cosmos balance
-                finalBalance = await getSeiBalance(
-                    wallet.cosmosAddress, 
-                    finalBlockHeight,
-                    primaryRestUrl,
-                    fallbackRestUrl
-                );
-            } catch (cosmosError) {
-                console.error(`Cosmos balance check failed for ${wallet.cosmosAddress}:`, cosmosError.message);
-                
-                // Fallback to EVM balance
-                finalBalance = await getEvmBalance(
-                    evmAddress,
-                    finalBlockHeight,
-                    primaryEvmRpc,
-                    fallbackEvmRpc
-                );
-            }
+            // Get balance using enhanced method with both Cosmos and EVM options
+            const finalBalance = await getSeiBalance(
+                wallet.cosmosAddress, 
+                finalBlockHeight,
+                primaryRestUrl,
+                fallbackRestUrl,
+                primaryEvmRpc,
+                fallbackEvmRpc
+            );
             
             // Format to 6 decimal places
-            finalBalance = Number(finalBalance.toFixed(DISPLAY_DECIMALS));
+            const formattedBalance = Number(finalBalance.toFixed(DISPLAY_DECIMALS));
             
-            wallet.finalBalance = finalBalance;
-            wallet.finalBalanceValid = finalBalance >= minSeiRequired;
+            wallet.finalBalance = formattedBalance;
+            wallet.finalBalanceValid = formattedBalance >= minSeiRequired;
             
             console.log(`${evmAddress} (${wallet.cosmosAddress}):`);
-            console.log(`  Final balance: ${finalBalance} SEI`);
+            console.log(`  Final balance: ${formattedBalance} SEI`);
             console.log(`  Final balance valid: ${wallet.finalBalanceValid}`);
             
             // Update validity of all votes for this wallet
@@ -486,4 +632,79 @@ export async function generateReport(
     console.log(`Reports generated at:`);
     console.log(`- Vote report: ${voteReportFile}`);
     console.log(`- Wallet report: ${walletReportFile}`);
+}
+
+/**
+ * Get cache statistics
+ * @returns {Object} Cache statistics
+ */
+export function getCacheStats() {
+    return {
+        addressCache: {
+            size: addressCache.size,
+            hits: addressCacheHits,
+            misses: addressCacheMisses,
+            hitRate: addressCacheHits / (addressCacheHits + addressCacheMisses || 1)
+        },
+        reverseAddressCache: {
+            size: reverseAddressCache.size
+        },
+        balanceCache: {
+            size: balanceCache.size,
+            hits: balanceCacheHits,
+            misses: balanceCacheMisses,
+            hitRate: balanceCacheHits / (balanceCacheHits + balanceCacheMisses || 1)
+        }
+    };
+}
+
+/**
+ * Clear caches to free memory
+ * @param {boolean} clearAddressCache Whether to clear address cache
+ * @param {boolean} clearBalanceCache Whether to clear balance cache
+ */
+export function clearCaches(clearAddressCache = false, clearBalanceCache = true) {
+    if (clearBalanceCache) {
+        console.log(`Clearing balance cache (${balanceCache.size} entries)`);
+        balanceCache.clear();
+    }
+    
+    if (clearAddressCache) {
+        console.log(`Clearing address cache (${addressCache.size} entries) and reverse cache (${reverseAddressCache.size} entries)`);
+        addressCache.clear();
+        reverseAddressCache.clear();
+    }
+}
+
+/**
+ * Adaptive cache management based on memory pressure
+ * @param {number} maxMemUsageMB Max memory usage in MB before aggressive clearing
+ * @param {number} targetMemUsageMB Target memory usage in MB after clearing
+ */
+export function adaptiveCacheManagement(maxMemUsageMB = 1024, targetMemUsageMB = 768) {
+    const memUsage = process.memoryUsage();
+    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+    
+    console.log(`Current memory usage: ${heapUsedMB} MB`);
+    
+    if (heapUsedMB > maxMemUsageMB) {
+        console.log(`Memory usage (${heapUsedMB} MB) exceeds threshold (${maxMemUsageMB} MB). Clearing caches...`);
+        
+        // Clear balance cache first (usually largest)
+        clearCaches(false, true);
+        
+        // If still too high, clear address caches too
+        const newMemUsage = process.memoryUsage();
+        const newHeapUsedMB = Math.round(newMemUsage.heapUsed / 1024 / 1024);
+        
+        if (newHeapUsedMB > targetMemUsageMB) {
+            clearCaches(true, false);
+        }
+        
+        // Force garbage collection if available
+        if (global.gc) {
+            global.gc();
+            console.log('Garbage collection triggered');
+        }
+    }
 }
