@@ -235,10 +235,10 @@ export async function findStartBlock(targetDate, primaryRpc, fallbackRpc) {
     const approxStartBlock = Math.max(1, currentBlockNumber - approxBlocksBack);
     console.log(`Approximate start block: ${approxStartBlock} (using ${SEI_BLOCK_TIME_MS}ms average block time)`);
     
-    // Set reasonable search range
-    const searchRange = Math.min(20000, Math.floor(approxBlocksBack / 2));
+    // Refine the search range calculation in findStartBlock function
+    const searchRange = Math.min(100000, approxBlocksBack); // Wider range
     const startSearchBlock = Math.max(1, approxStartBlock - searchRange);
-    const endSearchBlock = approxStartBlock + searchRange;
+    const endSearchBlock = Math.min(currentBlockNumber, approxStartBlock + searchRange);
     console.log(`Setting search range: ${startSearchBlock} to ${endSearchBlock}`);
     
     // Find exact start block using binary search

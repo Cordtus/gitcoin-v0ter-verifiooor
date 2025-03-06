@@ -2,6 +2,10 @@
  * Utility functions for SEI Voting Monitor
  */
 
+import { USEI_TO_SEI, WEI_DECIMALS, DISPLAY_DECIMALS } from './config.js';
+import fs from 'fs';
+
+
 /**
  * Convert decimal number to hex string
  * @param {number} decimalNumber Decimal number to convert
@@ -55,7 +59,7 @@ export function formatDateUTC(date) {
  * @returns {number} Formatted amount with 6 decimal places
  */
 export function formatSeiBalance(amount) {
-  return Number(amount.toFixed(6));
+  return Number(amount.toFixed(DISPLAY_DECIMALS));
 }
 
 /**
@@ -75,7 +79,7 @@ export function weiToSei(weiAmount) {
   }
   
   // Format to 6 decimal places
-  return Number(amount.toFixed(6));
+  return Number(amount.toFixed(DISPLAY_DECIMALS));
 }
 
 /**
@@ -88,7 +92,7 @@ export function useiToSei(useiAmount) {
   const amount = typeof useiAmount === 'string' ? Number(useiAmount) : useiAmount;
   
   // Format to 6 decimal places
-  return Number((amount / 1e6).toFixed(6));
+  return Number((amount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
 }
 
 /**
@@ -97,7 +101,7 @@ export function useiToSei(useiAmount) {
  * @returns {number} Amount in usei (integer)
  */
 export function seiToUsei(seiAmount) {
-  return Math.floor(seiAmount * 1e6);
+  return Math.floor(seiAmount * USEI_TO_SEI);
 }
 
 /**
@@ -136,4 +140,32 @@ export async function retry(fn, maxRetries = 5, initialDelay = 1000) {
       delay = delay * 2 * (0.8 + Math.random() * 0.4);
     }
   }
+}
+
+/**
+ * Ensure a directory exists
+ * @param {string} dirPath Directory path
+ */
+export function ensureDirectoryExists(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+/**
+ * Format bytes to human-readable string
+ * @param {number} bytes Number of bytes
+ * @param {number} decimals Number of decimal places
+ * @returns {string} Formatted string
+ */
+export function formatBytes(bytes, decimals = 2) {
+  if (bytes === 0) return '0 Bytes';
+
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'];
+
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }

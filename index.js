@@ -1,65 +1,43 @@
-// index.js
+// index.js - Main application entry point for SEI Voting Monitor
 
-import * as contractReader from './contractReader.js';
-import * as walletBalances from './walletBalances.js';
-import * as memoryManager from './memoryManager.js';
-import { findStartBlock, getBlockRangeForVotingPeriod } from './findStartBlock.js';
-import { scanBlockRangeForVotes } from './blockScanner.js';
-import { monitorForVotes, saveMonitorCheckpoint, loadMonitorCheckpoint } from './realTimeMonitor.js';
-import { BatchProcessor } from './batchProcessor.js';
-import { retry, sleep, formatDateUTC } from './utils.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { ethers } from 'ethers';
+
+// Import configuration
+import { 
+  PROXY_ADDRESS, 
+  IMPLEMENTATION_ADDRESS, 
+  MIN_SEI_REQUIRED,
+  VOTING_START_DATE,
+  VOTING_END_DATE,
+  RPC_ENDPOINTS,
+  PATHS,
+  BATCH,
+  MEMORY
+} from './config.js';
+
+// Import functionality modules
+import * as walletBalances from './walletBalances.js';
+import { scanBlockRangeForVotes, clearCaches } from './blockScanner.js';
+import { findStartBlock } from './findStartBlock.js';
+import { monitorForVotes, saveMonitorCheckpoint, loadMonitorCheckpoint } from './realTimeMonitor.js';
+import { generateReport } from './generateReport.js';
+import { 
+  startMemoryMonitoring, 
+  stopMemoryMonitoring,
+  manageMemory,
+  getMemoryUsage
+} from './memoryManager.js';
+import { 
+  sleep, 
+  ensureDirectoryExists 
+} from './utils.js';
 
 // Get directory name in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Configuration
-const PROXY_ADDRESS = '0x1E18cdce56B3754c4Dca34CB3a7439C24E8363de'.toLowerCase();
-const IMPLEMENTATION_ADDRESS = '0x05b939069163891997C879288f0BaaC3faaf4500'.toLowerCase();
-const MIN_SEI_REQUIRED = 100; // 100 SEI
-
-// Performance tuning
-const MEMORY_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
-const MAX_CACHED_BLOCKS = 5000;
-const MAX_CACHED_TXS = 10000;
-const PARALLEL_BALANCE_CHECKS = 20;
-const BALANCE_CHECK_THROTTLE = 10; // ms between balance check batches
-const SAVE_CHECKPOINT_INTERVAL = 5 * 60 * 1000; // 5 minutes
-
-// RPC endpoints with fallback options
-const RPC_ENDPOINTS = {
-    primary: {
-        rpc: 'https://rpc.sei.basementnodes.ca',
-        rest: 'https://api.sei.basementnodes.ca',
-        evmRpc: 'https://evm-rpc.sei.basementnodes.ca',
-        evmWs: 'wss://evm-ws.sei.basementnodes.ca'  // Add WebSocket URL here
-    },
-    archive: {
-        rpc: 'https://rpc.sei-main-eu.ccvalidators.com:443',
-        rest: 'https://rest.sei-main-eu.ccvalidators.com:443',
-        evmRpc: 'https://evm.sei-main-eu.ccvalidators.com:443',
-        evmWs: 'wss://evm-ws.sei-main-eu.ccvalidators.com:443'  // Add archive WebSocket URL if available
-    }
-};
-
-// Voting period
-// Define times in MST
-const VOTING_START_DATE_MST = new Date('2025/02/26 22:00 MST');
-const VOTING_END_DATE_MST = new Date('2025/03/12 10:00 MST');
-
-// Convert to UTC for blockchain querying (MST is UTC-7)
-const VOTING_START_DATE = new Date('2025/02/27 05:00Z'); // UTC equivalent of MST start time
-const VOTING_END_DATE = new Date('2025/03/12 17:00Z');   // UTC equivalent of MST end time
-
-// Data storage
-const DATA_DIR = path.join(__dirname, 'data');
-const WALLETS_FILE = path.join(DATA_DIR, 'wallets.json');
-const VOTES_FILE = path.join(DATA_DIR, 'votes.json');
-const LAST_BLOCK_FILE = path.join(DATA_DIR, 'last_processed_block.txt');
-const LOCK_FILE = path.join(DATA_DIR, 'monitor.lock');
 
 // Runtime state
 let isRunning = true;
@@ -70,9 +48,7 @@ let pendingVotes = [];
 let processingPromise = null;
 
 // Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+ensureDirectoryExists(PATHS.DATA_DIR);
 
 /**
  * Load the last processed block
@@ -80,8 +56,8 @@ if (!fs.existsSync(DATA_DIR)) {
  */
 function loadLastProcessedBlock() {
     try {
-        if (fs.existsSync(LAST_BLOCK_FILE)) {
-            return parseInt(fs.readFileSync(LAST_BLOCK_FILE, 'utf8'));
+        if (fs.existsSync(PATHS.LAST_BLOCK_FILE)) {
+            return parseInt(fs.readFileSync(PATHS.LAST_BLOCK_FILE, 'utf8'));
         }
     } catch (error) {
         console.error('Error loading last processed block:', error);
@@ -95,7 +71,7 @@ function loadLastProcessedBlock() {
  */
 function saveLastProcessedBlock(blockNumber) {
     try {
-        fs.writeFileSync(LAST_BLOCK_FILE, blockNumber.toString(), 'utf8');
+        fs.writeFileSync(PATHS.LAST_BLOCK_FILE, blockNumber.toString(), 'utf8');
         console.log(`Last processed block saved: ${blockNumber}`);
         lastCheckpointTime = Date.now();
     } catch (error) {
@@ -108,7 +84,7 @@ function saveLastProcessedBlock(blockNumber) {
  * @returns {boolean} True if locked, false otherwise
  */
 function isLocked() {
-    return fs.existsSync(LOCK_FILE);
+    return fs.existsSync(PATHS.LOCK_FILE);
 }
 
 /**
@@ -116,7 +92,7 @@ function isLocked() {
  */
 function createLock() {
     try {
-        fs.writeFileSync(LOCK_FILE, Date.now().toString(), 'utf8');
+        fs.writeFileSync(PATHS.LOCK_FILE, Date.now().toString(), 'utf8');
     } catch (error) {
         console.error('Error creating lock file:', error);
     }
@@ -127,37 +103,12 @@ function createLock() {
  */
 function removeLock() {
     try {
-        if (fs.existsSync(LOCK_FILE)) {
-            fs.unlinkSync(LOCK_FILE);
+        if (fs.existsSync(PATHS.LOCK_FILE)) {
+            fs.unlinkSync(PATHS.LOCK_FILE);
         }
     } catch (error) {
         console.error('Error removing lock file:', error);
     }
-}
-
-/**
- * Periodic memory management to prevent OOM issues
- */
-function setupMemoryManagement() {
-    // Start the enhanced adaptive memory management
-    memoryManager.startMemoryMonitoring(60000, {
-        warningThreshold: 1024,  // 1GB
-        criticalThreshold: 1536, // 1.5GB
-        targetUsage: 768,        // 750MB
-        reportInterval: 15 * 60 * 1000 // 15 minutes
-    });
-    
-    // Schedule memory checks at key points in the process
-    setInterval(() => {
-        // Check memory usage and adapt cache sizes
-        const memoryStatus = memoryManager.manageMemory();
-        if (memoryStatus.action !== 'none' && memoryStatus.action !== 'report_only') {
-            console.log(`Memory management action taken: ${memoryStatus.action}`);
-        }
-    }, MEMORY_CHECK_INTERVAL);
-    
-    // Log memory usage periodically
-    console.log('Memory monitoring started');
 }
 
 /**
@@ -171,8 +122,8 @@ async function processBatchOfVotes(votes) {
     
     // Process in smaller sub-batches for balance checks
     const subBatches = [];
-    for (let i = 0; i < votes.length; i += PARALLEL_BALANCE_CHECKS) {
-        subBatches.push(votes.slice(i, i + PARALLEL_BALANCE_CHECKS));
+    for (let i = 0; i < votes.length; i += BATCH.PARALLEL_BALANCE_CHECKS) {
+        subBatches.push(votes.slice(i, i + BATCH.PARALLEL_BALANCE_CHECKS));
     }
     
     for (const subBatch of subBatches) {
@@ -183,7 +134,7 @@ async function processBatchOfVotes(votes) {
                 const cosmosAddress = await walletBalances.convertEvmToCosmos(
                     vote.from,
                     RPC_ENDPOINTS.primary.rest,
-                    RPC_ENDPOINTS.archive.rest
+                    RPC_ENDPOINTS.fallback.rest
                 );
                 
                 // Check balance at vote and one block before
@@ -191,14 +142,18 @@ async function processBatchOfVotes(votes) {
                     cosmosAddress, 
                     vote.blockNumber,
                     RPC_ENDPOINTS.primary.rest,
-                    RPC_ENDPOINTS.archive.rest
+                    RPC_ENDPOINTS.fallback.rest,
+                    RPC_ENDPOINTS.primary.evmRpc,
+                    RPC_ENDPOINTS.fallback.evmRpc
                 );
                 
                 const balanceBeforeVote = await walletBalances.getSeiBalance(
                     cosmosAddress, 
                     vote.blockNumber - 1,
                     RPC_ENDPOINTS.primary.rest,
-                    RPC_ENDPOINTS.archive.rest
+                    RPC_ENDPOINTS.fallback.rest,
+                    RPC_ENDPOINTS.primary.evmRpc,
+                    RPC_ENDPOINTS.fallback.evmRpc
                 );
                 
                 // Record vote information
@@ -211,8 +166,8 @@ async function processBatchOfVotes(votes) {
                     balanceAtVote,
                     balanceBeforeVote,
                     MIN_SEI_REQUIRED,
-                    WALLETS_FILE,
-                    VOTES_FILE
+                    PATHS.WALLETS_FILE,
+                    PATHS.VOTES_FILE
                 );
                 
                 console.log(`Processed vote: ${vote.transactionHash.substring(0, 10)}... from ${vote.from.substring(0, 8)}...`);
@@ -228,7 +183,7 @@ async function processBatchOfVotes(votes) {
         await Promise.all(votePromises);
         
         // Add a small delay between sub-batches to avoid overwhelming APIs
-        await sleep(BALANCE_CHECK_THROTTLE);
+        await sleep(BATCH.BALANCE_CHECK_THROTTLE_MS);
     }
 }
 
@@ -276,7 +231,7 @@ function handleNewVote(vote) {
     
     // Save checkpoint periodically
     const now = Date.now();
-    if (now - lastCheckpointTime > SAVE_CHECKPOINT_INTERVAL) {
+    if (now - lastCheckpointTime > BATCH.SAVE_CHECKPOINT_INTERVAL_MS) {
         saveLastProcessedBlock(vote.blockNumber);
     }
 }
@@ -287,8 +242,7 @@ function handleNewVote(vote) {
 async function trackVotingActivity() {
     console.log('Starting SEI voting activity tracker...');
     console.log(`Current time: ${new Date().toISOString()}`);
-    console.log(`Voting period in MST: ${VOTING_START_DATE_MST.toLocaleString()} to ${VOTING_END_DATE_MST.toLocaleString()}`);
-    console.log(`Voting period in UTC: ${VOTING_START_DATE.toISOString()} to ${VOTING_END_DATE.toISOString()}`);
+    console.log(`Voting period: ${VOTING_START_DATE.toISOString()} to ${VOTING_END_DATE.toISOString()}`);
 
     // Check for lock
     if (isLocked()) {
@@ -301,7 +255,12 @@ async function trackVotingActivity() {
 
     try {
         // Setup memory management
-        setupMemoryManagement();
+        startMemoryMonitoring(60000, {
+            warningThreshold: MEMORY.WARNING_THRESHOLD,
+            criticalThreshold: MEMORY.CRITICAL_THRESHOLD,
+            targetUsage: MEMORY.TARGET_USAGE,
+            reportInterval: MEMORY.REPORT_INTERVAL
+        });
         
         // Get starting block
         let fromBlock = loadLastProcessedBlock();
@@ -310,7 +269,7 @@ async function trackVotingActivity() {
             fromBlock = await findStartBlock(
                 VOTING_START_DATE,
                 RPC_ENDPOINTS.primary.evmRpc,
-                RPC_ENDPOINTS.archive.evmRpc
+                RPC_ENDPOINTS.fallback.evmRpc
             );
             console.log(`Found exact starting block: ${fromBlock}`);
             
@@ -319,10 +278,15 @@ async function trackVotingActivity() {
         }
 
         // Get current block
-        const currentBlock = await contractReader.getCurrentBlockHeight(
-            RPC_ENDPOINTS.primary.evmRpc, 
-            RPC_ENDPOINTS.archive.evmRpc
-        );
+        const provider = new ethers.JsonRpcProvider(RPC_ENDPOINTS.primary.evmRpc);
+        let currentBlock;
+        try {
+            currentBlock = await provider.getBlockNumber();
+        } catch (error) {
+            console.error('Error getting current block from primary RPC:', error.message);
+            const fallbackProvider = new ethers.JsonRpcProvider(RPC_ENDPOINTS.fallback.evmRpc);
+            currentBlock = await fallbackProvider.getBlockNumber();
+        }
         console.log(`Current block: ${currentBlock}`);
 
         // Check if we have historical data to process
@@ -332,13 +296,14 @@ async function trackVotingActivity() {
             
             // Fetch historical voting events in optimized batches
             try {
-                const events = await contractReader.fetchVotingEvents(
+                const events = await scanBlockRangeForVotes(
                     fromBlock, 
                     currentBlock, 
                     [PROXY_ADDRESS, IMPLEMENTATION_ADDRESS],
                     RPC_ENDPOINTS.primary.evmRpc,
-                    RPC_ENDPOINTS.archive.evmRpc,
-                    true // Initial historical fetch
+                    RPC_ENDPOINTS.fallback.evmRpc,
+                    null,
+                    true
                 );
                 
                 console.log(`Found ${events.length} historical voting transactions`);
@@ -358,6 +323,9 @@ async function trackVotingActivity() {
                         const latestBlock = Math.max(...batch.map(event => event.blockNumber));
                         saveLastProcessedBlock(latestBlock);
                     }
+                    
+                    // Check memory usage and clear caches if needed
+                    manageMemory();
                 }
                 
                 // Update last processed block
@@ -374,20 +342,21 @@ async function trackVotingActivity() {
 
         // Start live monitoring
         console.log('Starting live monitoring...');
-        voteListener = contractReader.listenForVotes(
+        voteListener = monitorForVotes(
             currentBlock,
             [PROXY_ADDRESS, IMPLEMENTATION_ADDRESS],
-            RPC_ENDPOINTS.primary.evmRpc,
-            RPC_ENDPOINTS.archive.evmRpc,
-            handleNewVote
+            RPC_ENDPOINTS,
+            handleNewVote,
+            (blockNumber) => {
+                // Block processed callback to periodically save checkpoint
+                const now = Date.now();
+                if (now - lastCheckpointTime > BATCH.SAVE_CHECKPOINT_INTERVAL_MS) {
+                    saveLastProcessedBlock(blockNumber);
+                }
+            },
+            VOTING_END_DATE
         );
         
-        // Check if voting period is over
-        const now = new Date();
-        if (now >= VOTING_END_DATE) {
-            await generateFinalReport();
-        }
-
         return true;
     } catch (error) {
         console.error('Error tracking voting activity:', error);
@@ -403,10 +372,15 @@ async function generateFinalReport() {
     console.log('Voting period has ended. Generating final report...');
     
     // Get current block for final check
-    const currentBlock = await contractReader.getCurrentBlockHeight(
-        RPC_ENDPOINTS.primary.evmRpc, 
-        RPC_ENDPOINTS.archive.evmRpc
-    );
+    let currentBlock;
+    try {
+        const provider = new ethers.JsonRpcProvider(RPC_ENDPOINTS.primary.evmRpc);
+        currentBlock = await provider.getBlockNumber();
+    } catch (error) {
+        console.error('Error getting current block from primary RPC:', error.message);
+        const fallbackProvider = new ethers.JsonRpcProvider(RPC_ENDPOINTS.fallback.evmRpc);
+        currentBlock = await fallbackProvider.getBlockNumber();
+    }
     
     // Stop listening for new votes
     if (voteListener) {
@@ -418,22 +392,16 @@ async function generateFinalReport() {
     await walletBalances.checkFinalBalances(
         currentBlock,
         MIN_SEI_REQUIRED,
-        WALLETS_FILE,
-        VOTES_FILE,
+        PATHS.WALLETS_FILE,
+        PATHS.VOTES_FILE,
         RPC_ENDPOINTS.primary.rest,
-        RPC_ENDPOINTS.archive.rest,
+        RPC_ENDPOINTS.fallback.rest,
         RPC_ENDPOINTS.primary.evmRpc,
-        RPC_ENDPOINTS.archive.evmRpc
+        RPC_ENDPOINTS.fallback.evmRpc
     );
     
     // Generate reports
-    await walletBalances.generateReport(
-        WALLETS_FILE, 
-        VOTES_FILE, 
-        MIN_SEI_REQUIRED,
-        path.join(DATA_DIR, 'voting_report.csv'),
-        path.join(DATA_DIR, 'wallet_report.csv')
-    );
+    await generateReport();
     
     console.log('Final report generation complete.');
 }
@@ -442,32 +410,30 @@ async function generateFinalReport() {
  * Clean shutdown handler
  */
 function cleanup() {
-    console.log('Shutting down...');
+    console.log('\nShutting down gracefully...');
     isRunning = false;
     
-    // Stop memory monitoring (new line)
-    memoryManager.stopMemoryMonitoring();
-    
-    // Stop vote listener
-    if (voteListener) {
-        voteListener.stop();
-        voteListener = null;
+    try {
+      // Stop all services
+      stopMemoryMonitoring();
+      if (voteListener) voteListener.stop();
+      
+      // Process remaining votes
+      if (pendingVotes.length > 0) {
+        console.log(`Processing ${pendingVotes.length} remaining votes...`);
+      }
+      
+      // Remove lock file
+      removeLock();
+      console.log('Cleanup complete');
+    } catch (e) {
+      console.error('Error during cleanup:', e);
     }
     
-    // Process any remaining votes
-    if (pendingVotes.length > 0) {
-        console.log(`Processing ${pendingVotes.length} remaining votes before shutdown...`);
-        processBatchOfVotes(pendingVotes).finally(() => {
-            console.log('Final vote processing complete.');
-            removeLock();
-            console.log('Cleanup complete.');
-        });
-    } else {
-        removeLock();
-        console.log('Cleanup complete.');
-    }
-}
-
+    // Force immediate exit
+    process.exit(0);
+  }
+  
 /**
  * Schedule periodic checks
  */
@@ -478,25 +444,23 @@ async function schedulePeriodicChecks() {
         process.on('SIGTERM', cleanup);
         
         // Start monitoring
-        await trackVotingActivity();
+        const monitoringStarted = await trackVotingActivity();
         
-        // Schedule next check if needed
+        if (!monitoringStarted) {
+            console.error('Failed to start monitoring. Exiting...');
+            cleanup();
+            return;
+        }
+        
+        // Check if voting period is already over
         const now = new Date();
-        if (now < VOTING_END_DATE && isRunning) {
-            const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
-            console.log(`Scheduling next check in 12 hours (${new Date(now.getTime() + TWELVE_HOURS_MS).toISOString()})`);
-            setTimeout(schedulePeriodicChecks, TWELVE_HOURS_MS);
-        } else {
-            console.log('Voting period has ended. Final check complete.');
+        if (now >= VOTING_END_DATE && isRunning) {
+            await generateFinalReport();
             cleanup();
         }
     } catch (error) {
         console.error('Error in monitoring cycle:', error);
-        // Retry after an hour on failure
-        if (isRunning) {
-            console.log('Will retry in 1 hour');
-            setTimeout(schedulePeriodicChecks, 60 * 60 * 1000);
-        }
+        cleanup();
     }
 }
 

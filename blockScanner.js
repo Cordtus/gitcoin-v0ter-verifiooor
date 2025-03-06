@@ -6,6 +6,20 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import { 
+  PROXY_ADDRESS, 
+  IMPLEMENTATION_ADDRESS, 
+  VOTE_METHOD_SIG,
+  RPC_ENDPOINTS 
+} from './config.js';
+import { 
+  blockCache, 
+  txCache, 
+  receiptCache, 
+  clearCaches,
+  getCacheStats, 
+  limitCacheSizes 
+} from './cache.js';
 
 // Get directory name in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -19,24 +33,6 @@ const REQUEST_THROTTLE_MS = 50;
 const BLOCK_TIMEOUT_MS = 8000;
 const RECEIPT_TIMEOUT_MS = 5000;
 
-// SEI voting contract parameters
-const PROXY_ADDRESS = '0x1E18cdce56B3754c4Dca34CB3a7439C24E8363de'.toLowerCase();
-const IMPLEMENTATION_ADDRESS = '0x05b939069163891997C879288f0BaaC3faaf4500'.toLowerCase();
-const VOTE_METHOD_SIG = '0xc7b8896b'; // Verified vote method signature
-
-// Cache for blocks and transactions
-const blockCache = new Map();
-const txCache = new Map();
-const receiptCache = new Map();
-
-// Cache statistics
-let blockCacheHits = 0;
-let blockCacheMisses = 0;
-let txCacheHits = 0;
-let txCacheMisses = 0;
-let receiptCacheHits = 0;
-let receiptCacheMisses = 0;
-
 /**
  * Get block with transactions
  * @param {number} blockNumber Block number
@@ -46,12 +42,10 @@ let receiptCacheMisses = 0;
 async function getBlockWithTransactions(blockNumber, provider) {
   // Check cache first
   const cacheKey = `block-${blockNumber}`;
-  if (blockCache.has(cacheKey)) {
-    blockCacheHits++;
-    return blockCache.get(cacheKey);
+  const cachedBlock = blockCache.get(cacheKey);
+  if (cachedBlock) {
+    return cachedBlock;
   }
-  
-  blockCacheMisses++;
   
   try {
     // Get block with timeout
@@ -111,12 +105,10 @@ async function getBlockWithTransactions(blockNumber, provider) {
 async function getTransactionReceipt(txHash, provider) {
   // Check cache first
   const cacheKey = `receipt-${txHash}`;
-  if (receiptCache.has(cacheKey)) {
-    receiptCacheHits++;
-    return receiptCache.get(cacheKey);
+  const cachedReceipt = receiptCache.get(cacheKey);
+  if (cachedReceipt) {
+    return cachedReceipt;
   }
-  
-  receiptCacheMisses++;
   
   try {
     // Get receipt with timeout
@@ -178,12 +170,12 @@ function isVoteTransaction(tx, receipt) {
     tx.data.startsWith(VOTE_METHOD_SIG);
   
   // Method 3: Check logs for implementation contract
-  const hasImplLogs = receipt.logs && receipt.logs.some(log => 
+  const hasImplLogs = receipt?.logs && receipt.logs.some(log => 
     log.address && log.address.toLowerCase() === IMPLEMENTATION_ADDRESS
   );
   
   // Method 4: Check logs for proxy contract
-  const hasProxyLogs = receipt.logs && receipt.logs.some(log => 
+  const hasProxyLogs = receipt?.logs && receipt.logs.some(log => 
     log.address && log.address.toLowerCase() === PROXY_ADDRESS
   );
   
@@ -209,9 +201,9 @@ function isVoteTransaction(tx, receipt) {
 export async function scanBlockRangeForVotes(
   fromBlock, 
   toBlock, 
-  addresses, 
-  primaryRpc, 
-  fallbackRpc,
+  addresses = [PROXY_ADDRESS, IMPLEMENTATION_ADDRESS], 
+  primaryRpc = RPC_ENDPOINTS.primary.evmRpc, 
+  fallbackRpc = RPC_ENDPOINTS.fallback.evmRpc,
   onVoteFound = null,
   saveProgress = false
 ) {
@@ -372,13 +364,12 @@ async function processBlockRange(fromBlock, toBlock, proxyAddress, implAddress, 
             try {
             // Check cache first
             const cacheKey = `tx-${txHash}`;
-            if (txCache.has(cacheKey)) {
-                txCacheHits++;
-                transactions.push(txCache.get(cacheKey));
+            const cachedTx = txCache.get(cacheKey);
+            if (cachedTx) {
+                transactions.push(cachedTx);
                 continue;
             }
             
-            txCacheMisses++;
             const tx = await provider.getTransaction(txHash);
             if (tx) {
                 txCache.set(cacheKey, tx);
@@ -441,53 +432,5 @@ async function processBlockRange(fromBlock, toBlock, proxyAddress, implAddress, 
   return blockVotes;
 }
 
-/**
-* Clear caches to free memory
-*/
-export function clearCaches() {
-  console.log(`Clearing caches: ${blockCache.size} blocks, ${txCache.size} transactions, ${receiptCache.size} receipts`);
-  blockCache.clear();
-  txCache.clear();
-  receiptCache.clear();
-  
-  // Reset cache statistics
-  blockCacheHits = 0;
-  blockCacheMisses = 0;
-  txCacheHits = 0;
-  txCacheMisses = 0;
-  receiptCacheHits = 0;
-  receiptCacheMisses = 0;
-}
-
-/**
-* Get cache statistics
-* @returns {Object} Cache statistics
-*/
-export function getCacheStats() {
-  return {
-    blockCache: {
-      size: blockCache.size,
-      hits: blockCacheHits,
-      misses: blockCacheMisses,
-      efficiency: blockCacheHits + blockCacheMisses > 0 
-        ? (blockCacheHits / (blockCacheHits + blockCacheMisses)).toFixed(2) 
-        : 0
-    },
-    txCache: {
-      size: txCache.size,
-      hits: txCacheHits,
-      misses: txCacheMisses,
-      efficiency: txCacheHits + txCacheMisses > 0 
-        ? (txCacheHits / (txCacheHits + txCacheMisses)).toFixed(2) 
-        : 0
-    },
-    receiptCache: {
-      size: receiptCache.size,
-      hits: receiptCacheHits,
-      misses: receiptCacheMisses,
-      efficiency: receiptCacheHits + receiptCacheMisses > 0 
-        ? (receiptCacheHits / (receiptCacheHits + receiptCacheMisses)).toFixed(2) 
-        : 0
-    }
-  };
-}
+// Export the required functions and caches
+export { clearCaches, getCacheStats, limitCacheSizes };

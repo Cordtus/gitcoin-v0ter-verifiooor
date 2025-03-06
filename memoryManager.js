@@ -2,115 +2,8 @@
  * Memory management utilities for the SEI Voting Monitor
  */
 
-import * as contractReader from './blockScanner.js';
-import * as walletBalances from './walletBalances.js';
-
-// Default thresholds in MB
-const DEFAULT_WARNING_THRESHOLD = 1024;    // 1GB
-const DEFAULT_CRITICAL_THRESHOLD = 1536;   // 1.5GB
-const DEFAULT_TARGET_USAGE = 768;          // 750MB
-
-// Memory monitoring state
-let isMonitoring = false;
-let monitorInterval = null;
-let lastMemoryReport = Date.now();
-let memoryReportInterval = 15 * 60 * 1000; // 15 minutes
-let warningThreshold = DEFAULT_WARNING_THRESHOLD;
-let criticalThreshold = DEFAULT_CRITICAL_THRESHOLD;
-let targetUsage = DEFAULT_TARGET_USAGE;
-
-/**
- * Get current memory usage in MB
- * @returns {Object} Memory usage statistics
- */
-export function getMemoryUsage() {
-    const memUsage = process.memoryUsage();
-    
-    return {
-        rss: Math.round(memUsage.rss / 1024 / 1024),           // Resident Set Size
-        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024), // Total heap size
-        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),   // Used heap
-        external: Math.round(memUsage.external / 1024 / 1024),   // External memory (buffers)
-        arrayBuffers: Math.round((memUsage.arrayBuffers || 0) / 1024 / 1024) // Buffer allocations
-    };
-}
-
-/**
- * Perform adaptive cache management based on memory pressure
- * @param {boolean} force Force cache clearing regardless of thresholds
- * @returns {Object} Action taken and current memory usage
- */
-export function manageMemory(force = false) {
-    const memUsage = getMemoryUsage();
-    const heapUsedMB = memUsage.heapUsed;
-    let action = 'none';
-    
-    // Generate cache statistics for logging
-    const contractReaderCacheStats = contractReader.getCacheStats ? contractReader.getCacheStats() : { blockCache: { size: 'unknown' }, txCache: { size: 'unknown' } };
-    const walletBalancesCacheStats = walletBalances.getCacheStats ? walletBalances.getCacheStats() : { addressCache: { size: 'unknown' }, balanceCache: { size: 'unknown' } };
-    
-    // Log cache statistics
-    console.log('Cache statistics:');
-    console.log(`  Contract reader: ${JSON.stringify(contractReaderCacheStats)}`);
-    console.log(`  Wallet balances: ${JSON.stringify(walletBalancesCacheStats)}`);
-    
-    // Check if memory usage exceeds thresholds or force is true
-    if (force || heapUsedMB > criticalThreshold) {
-        // Critical threshold exceeded - aggressive clearing
-        console.log(`CRITICAL MEMORY PRESSURE: ${heapUsedMB}MB used exceeds ${criticalThreshold}MB threshold. Aggressive cache clearing...`);
-        
-        // Clear all caches
-        contractReader.clearCaches();
-        walletBalances.clearCaches(true, true);
-        
-        // Force garbage collection if available
-        if (global.gc) {
-            global.gc();
-            console.log('Garbage collection triggered');
-        }
-        
-        action = 'aggressive_clearing';
-    } else if (heapUsedMB > warningThreshold) {
-        // Warning threshold exceeded - selective clearing
-        console.log(`WARNING: Memory usage (${heapUsedMB}MB) exceeds warning threshold (${warningThreshold}MB). Selective cache clearing...`);
-        
-        // Get cache statistics to make smart decisions about what to clear
-        // Balance cache is usually the largest, so clear it first
-        walletBalances.clearCaches(false, true);
-        
-        // Limit other caches to a reasonable size
-        contractReader.limitCacheSizes(2000, 5000);
-        
-        // Force garbage collection if available
-        if (global.gc) {
-            global.gc();
-            console.log('Garbage collection triggered');
-        }
-        
-        action = 'selective_clearing';
-    } else if (Date.now() - lastMemoryReport > memoryReportInterval) {
-        // Just log memory usage periodically
-        console.log('Memory usage report:');
-        console.log(`  RSS: ${memUsage.rss}MB`);
-        console.log(`  Heap total: ${memUsage.heapTotal}MB`);
-        console.log(`  Heap used: ${heapUsedMB}MB`);
-        console.log(`  External: ${memUsage.external}MB`);
-        console.log(`  Array buffers: ${memUsage.arrayBuffers}MB`);
-        
-        lastMemoryReport = Date.now();
-        action = 'report_only';
-    }
-    
-    // Return current status and action taken
-    return {
-        action,
-        memoryUsage: memUsage,
-        cacheStats: {
-            contractReader: contractReaderCacheStats,
-            walletBalances: walletBalancesCacheStats
-        }
-    };
-}
+import { clearCaches, limitCacheSizes, getCacheStats } from './cache.js';
+import { MEMORY } from './config.js';
 
 /**
  * Start automated memory monitoring
@@ -125,10 +18,10 @@ export function startMemoryMonitoring(interval = 60000, options = {}) {
     }
     
     // Configure thresholds
-    warningThreshold = options.warningThreshold || DEFAULT_WARNING_THRESHOLD;
-    criticalThreshold = options.criticalThreshold || DEFAULT_CRITICAL_THRESHOLD;
-    targetUsage = options.targetUsage || DEFAULT_TARGET_USAGE;
-    memoryReportInterval = options.reportInterval || memoryReportInterval;
+    warningThreshold = options.warningThreshold || MEMORY.WARNING_THRESHOLD;
+    criticalThreshold = options.criticalThreshold || MEMORY.CRITICAL_THRESHOLD;
+    targetUsage = options.targetUsage || MEMORY.TARGET_USAGE;
+    memoryReportInterval = options.reportInterval || MEMORY.REPORT_INTERVAL;
     
     console.log(`Starting memory monitoring with ${interval}ms interval`);
     console.log(`  Warning threshold: ${warningThreshold}MB`);
@@ -196,10 +89,120 @@ export function setMemoryThresholds(options = {}) {
  * Reset memory management to default settings
  */
 export function resetMemoryThresholds() {
-    warningThreshold = DEFAULT_WARNING_THRESHOLD;
-    criticalThreshold = DEFAULT_CRITICAL_THRESHOLD;
-    targetUsage = DEFAULT_TARGET_USAGE;
-    memoryReportInterval = 15 * 60 * 1000;
+    warningThreshold = MEMORY.WARNING_THRESHOLD;
+    criticalThreshold = MEMORY.CRITICAL_THRESHOLD;
+    targetUsage = MEMORY.TARGET_USAGE;
+    memoryReportInterval = MEMORY.REPORT_INTERVAL;
     
     console.log('Memory management thresholds reset to defaults');
+}
+
+// Memory monitoring state
+let isMonitoring = false;
+let monitorInterval = null;
+let lastMemoryReport = Date.now();
+let memoryReportInterval = MEMORY.REPORT_INTERVAL;
+let warningThreshold = MEMORY.WARNING_THRESHOLD;
+let criticalThreshold = MEMORY.CRITICAL_THRESHOLD;
+let targetUsage = MEMORY.TARGET_USAGE;
+
+/**
+ * Get current memory usage in MB
+ * @returns {Object} Memory usage statistics
+ */
+export function getMemoryUsage() {
+    const memUsage = process.memoryUsage();
+    
+    return {
+        rss: Math.round(memUsage.rss / 1024 / 1024),           // Resident Set Size
+        heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024), // Total heap size
+        heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),   // Used heap
+        external: Math.round(memUsage.external / 1024 / 1024),   // External memory (buffers)
+        arrayBuffers: Math.round((memUsage.arrayBuffers || 0) / 1024 / 1024) // Buffer allocations
+    };
+}
+
+/**
+ * Perform adaptive cache management based on memory pressure
+ * @param {boolean} force Force cache clearing regardless of thresholds
+ * @returns {Object} Action taken and current memory usage
+ */
+export function manageMemory(force = false) {
+    const memUsage = getMemoryUsage();
+    const heapUsedMB = memUsage.heapUsed;
+    let action = 'none';
+    
+    // Generate cache statistics for logging
+    const cacheStats = getCacheStats();
+    
+    // Log cache statistics
+    console.log('Cache statistics:');
+    console.log(`  Total entries: ${cacheStats.totalEntries}`);
+    
+    // Check if memory usage exceeds thresholds or force is true
+    if (force || heapUsedMB > criticalThreshold) {
+        // Critical threshold exceeded - aggressive clearing
+        console.log(`CRITICAL MEMORY PRESSURE: ${heapUsedMB}MB used exceeds ${criticalThreshold}MB threshold. Aggressive cache clearing...`);
+        
+        // Clear all caches
+        clearCaches({
+            blocks: true,
+            transactions: true,
+            receipts: true,
+            addresses: true,
+            reverseAddresses: true,
+            balances: true
+        });
+        
+        // Force garbage collection if available
+        if (global.gc) {
+            global.gc();
+            console.log('Garbage collection triggered');
+        }
+        
+        action = 'aggressive_clearing';
+    } else if (heapUsedMB > warningThreshold) {
+        // Warning threshold exceeded - selective clearing
+        console.log(`WARNING: Memory usage (${heapUsedMB}MB) exceeds warning threshold (${warningThreshold}MB). Selective cache clearing...`);
+        
+        // Get cache statistics to make smart decisions about what to clear
+        // Balance cache is usually the largest, so clear it first
+        clearCaches({
+            blocks: false,
+            transactions: false,
+            receipts: false,
+            addresses: false,
+            reverseAddresses: false,
+            balances: true
+        });
+        
+        // Limit other caches to a reasonable size
+        limitCacheSizes(2000, 5000, 5000, 1000, 5000);
+        
+        // Force garbage collection if available
+        if (global.gc) {
+            global.gc();
+            console.log('Garbage collection triggered');
+        }
+        
+        action = 'selective_clearing';
+    } else if (Date.now() - lastMemoryReport > memoryReportInterval) {
+        // Just log memory usage periodically
+        console.log('Memory usage report:');
+        console.log(`  RSS: ${memUsage.rss}MB`);
+        console.log(`  Heap total: ${memUsage.heapTotal}MB`);
+        console.log(`  Heap used: ${heapUsedMB}MB`);
+        console.log(`  External: ${memUsage.external}MB`);
+        console.log(`  Array buffers: ${memUsage.arrayBuffers}MB`);
+        
+        lastMemoryReport = Date.now();
+        action = 'report_only';
+    }
+    
+    // Return current status and action taken
+    return {
+        action,
+        memoryUsage: memUsage,
+        cacheStats
+    };
 }

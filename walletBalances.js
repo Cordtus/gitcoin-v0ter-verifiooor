@@ -3,25 +3,24 @@
 import { ethers } from 'ethers';
 import axios from 'axios';
 import fs from 'fs';
-import { retry, sleep } from './utils.js';
+import { retry, sleep, formatSeiBalance, useiToSei } from './utils.js';
+import { 
+  USEI_TO_SEI, 
+  WEI_DECIMALS, 
+  DISPLAY_DECIMALS, 
+  WALLET_CONVERTER_API,
+  MIN_SEI_REQUIRED,
+  PATHS
+} from './config.js';
+import {
+  addressCache,
+  reverseAddressCache,
+  balanceCache,
+  getCacheStats
+} from './cache.js';
 
-// Constants
-const USEI_TO_SEI = 1000000; // 1 SEI = 1,000,000 uSEI
-const WEI_DECIMALS = 18;     // 1 SEI = 10^18 wei (asei)
-const DISPLAY_DECIMALS = 6;  // Keep 6 decimal places for display
-const WALLET_CONVERTER_API = 'https://wallets.sei.basementnodes.ca';
+// API request constants
 const REVERSE_LOOKUP_TIMEOUT = 10000; // 10 seconds timeout for reverse lookup
-
-// In-memory cache for wallet mappings and balances
-const addressCache = new Map();
-const balanceCache = new Map();
-const reverseAddressCache = new Map(); // New cache for cosmos->evm lookups
-
-// Cache statistics for adaptive management
-let addressCacheHits = 0;
-let addressCacheMisses = 0;
-let balanceCacheHits = 0;
-let balanceCacheMisses = 0;
 
 /**
  * Convert EVM address to Cosmos address
@@ -35,12 +34,10 @@ export async function convertEvmToCosmos(evmAddress, primaryRestUrl, fallbackRes
     const normalizedAddr = evmAddress.toLowerCase();
     
     // Check cache first
-    if (addressCache.has(normalizedAddr)) {
-        addressCacheHits++;
-        return addressCache.get(normalizedAddr);
+    const cachedAddress = addressCache.get(normalizedAddr);
+    if (cachedAddress) {
+        return cachedAddress;
     }
-    
-    addressCacheMisses++;
     
     return await retry(async () => {
         try {
@@ -86,12 +83,10 @@ export async function convertEvmToCosmos(evmAddress, primaryRestUrl, fallbackRes
  */
 export async function convertCosmosToEvm(cosmosAddress, primaryRestUrl, fallbackRestUrl) {
     // Check cache first
-    if (reverseAddressCache.has(cosmosAddress)) {
-        addressCacheHits++;
-        return reverseAddressCache.get(cosmosAddress);
+    const cachedAddress = reverseAddressCache.get(cosmosAddress);
+    if (cachedAddress) {
+        return cachedAddress;
     }
-    
-    addressCacheMisses++;
     
     // Method 1: Try API for reverse lookup if available
     try {
@@ -127,9 +122,6 @@ export async function convertCosmosToEvm(cosmosAddress, primaryRestUrl, fallback
         }
     }
     
-    // Method 3: Try to find through EVM Chain query (this is more complex and depends on contract availability)
-    // This is a placeholder for an actual implementation
-    
     // If all methods fail, we need to reject
     throw new Error(`Could not convert Cosmos address ${cosmosAddress} to EVM address`);
 }
@@ -147,12 +139,10 @@ export async function convertCosmosToEvm(cosmosAddress, primaryRestUrl, fallback
 export async function getSeiBalance(cosmosAddress, blockHeight, primaryRestUrl, fallbackRestUrl, primaryEvmRpc, fallbackEvmRpc) {
     // Check cache first
     const cacheKey = `${cosmosAddress}-${blockHeight}`;
-    if (balanceCache.has(cacheKey)) {
-        balanceCacheHits++;
-        return balanceCache.get(cacheKey);
+    const cachedBalance = balanceCache.get(cacheKey);
+    if (cachedBalance !== null) {
+        return cachedBalance;
     }
-    
-    balanceCacheMisses++;
     
     // Create array of methods to try
     const balanceMethods = [
@@ -230,8 +220,7 @@ async function getCosmosBalance(cosmosAddress, blockHeight, primaryRestUrl, fall
             if (response.data && response.data.balance && response.data.balance.amount) {
                 // The amount will be in "usei" format (e.g., "100000000" for 100 SEI)
                 const uSeiAmount = parseInt(response.data.balance.amount);
-                const seiAmount = Number((uSeiAmount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
-                return seiAmount;
+                return useiToSei(uSeiAmount);
             }
             
             // No balance found
@@ -256,8 +245,7 @@ async function getCosmosBalance(cosmosAddress, blockHeight, primaryRestUrl, fall
             
             if (response.data && response.data.balance && response.data.balance.amount) {
                 const uSeiAmount = parseInt(response.data.balance.amount);
-                const seiAmount = Number((uSeiAmount / USEI_TO_SEI).toFixed(DISPLAY_DECIMALS));
-                return seiAmount;
+                return useiToSei(uSeiAmount);
             }
             
             return 0;
@@ -295,7 +283,7 @@ async function getEvmBalance(address, blockHeight, primaryEvmRpc, fallbackEvmRpc
                     
                     // Convert from wei to SEI with 6 decimal places
                     const seiAmount = Number(ethers.formatUnits(balanceWei, WEI_DECIMALS));
-                    return Number(seiAmount.toFixed(DISPLAY_DECIMALS));
+                    return formatSeiBalance(seiAmount);
                 } catch (error) {
                     throw error;
                 }
@@ -324,7 +312,7 @@ async function getEvmBalance(address, blockHeight, primaryEvmRpc, fallbackEvmRpc
                 
                 // Convert from wei to SEI with 6 decimal places
                 const seiAmount = Number(ethers.formatUnits(balanceWei, WEI_DECIMALS));
-                return Number(seiAmount.toFixed(DISPLAY_DECIMALS));
+                return formatSeiBalance(seiAmount);
             })();
             
             return await Promise.race([balancePromise, timeoutPromise]);
@@ -417,9 +405,9 @@ export async function recordVote(
     timestamp, 
     balanceAtVote, 
     balanceBeforeVote, 
-    minSeiRequired,
-    walletsFile,
-    votesFile
+    minSeiRequired = MIN_SEI_REQUIRED,
+    walletsFile = PATHS.WALLETS_FILE,
+    votesFile = PATHS.VOTES_FILE
 ) {
     // Standardize EVM address
     evmAddress = evmAddress.toLowerCase();
@@ -434,8 +422,8 @@ export async function recordVote(
     }
     
     // Format balances to 6 decimal places
-    balanceAtVote = Number(balanceAtVote.toFixed(DISPLAY_DECIMALS));
-    balanceBeforeVote = Number(balanceBeforeVote.toFixed(DISPLAY_DECIMALS));
+    balanceAtVote = formatSeiBalance(balanceAtVote);
+    balanceBeforeVote = formatSeiBalance(balanceBeforeVote);
     
     // Initial validity check
     const isValid = balanceAtVote >= minSeiRequired && balanceBeforeVote >= minSeiRequired;
@@ -473,8 +461,10 @@ export async function recordVote(
     wallet.balances[blockNumber] = balanceAtVote;
     wallet.balances[blockNumber - 1] = balanceBeforeVote;
     
-    // Add vote reference
-    wallet.votes.push(txHash);
+    // Add vote reference if not already present
+    if (!wallet.votes.includes(txHash)) {
+        wallet.votes.push(txHash);
+    }
     
     // Save updated data
     saveWalletData(wallets, walletsFile);
@@ -494,9 +484,9 @@ export async function recordVote(
  */
 export async function checkFinalBalances(
     finalBlockHeight, 
-    minSeiRequired, 
-    walletsFile, 
-    votesFile,
+    minSeiRequired = MIN_SEI_REQUIRED, 
+    walletsFile = PATHS.WALLETS_FILE, 
+    votesFile = PATHS.VOTES_FILE,
     primaryRestUrl,
     fallbackRestUrl,
     primaryEvmRpc,
@@ -527,7 +517,7 @@ export async function checkFinalBalances(
             );
             
             // Format to 6 decimal places
-            const formattedBalance = Number(finalBalance.toFixed(DISPLAY_DECIMALS));
+            const formattedBalance = formatSeiBalance(finalBalance);
             
             wallet.finalBalance = formattedBalance;
             wallet.finalBalanceValid = formattedBalance >= minSeiRequired;
@@ -574,11 +564,11 @@ export async function checkFinalBalances(
  * @param {string} walletReportFile Wallet report file path
  */
 export async function generateReport(
-    walletsFile,
-    votesFile,
-    minSeiRequired,
-    voteReportFile,
-    walletReportFile
+    walletsFile = PATHS.WALLETS_FILE,
+    votesFile = PATHS.VOTES_FILE,
+    minSeiRequired = MIN_SEI_REQUIRED,
+    voteReportFile = PATHS.REPORT.VOTES,
+    walletReportFile = PATHS.REPORT.WALLETS
 ) {
     // Load existing data
     const wallets = loadWalletData(walletsFile);
@@ -612,6 +602,9 @@ export async function generateReport(
     
     fs.writeFileSync(walletReportFile, walletReport, 'utf8');
     
+    // Generate summary statistics
+    generateStatisticsFile(wallets, votes, PATHS.REPORT.STATS, minSeiRequired);
+    
     // Print summary
     const totalVotes = votes.size;
     const validVotes = Array.from(votes.values()).filter(vote => vote.finalIsValid).length;
@@ -632,79 +625,122 @@ export async function generateReport(
     console.log(`Reports generated at:`);
     console.log(`- Vote report: ${voteReportFile}`);
     console.log(`- Wallet report: ${walletReportFile}`);
+    console.log(`- Statistics: ${PATHS.REPORT.STATS}`);
 }
 
 /**
- * Get cache statistics
- * @returns {Object} Cache statistics
+ * Generate a statistics JSON file
+ * @param {Map} wallets Wallet data
+ * @param {Map} votes Vote data
+ * @param {string} statsFile Path to save statistics
+ * @param {number} minSeiRequired Minimum SEI required
  */
-export function getCacheStats() {
-    return {
-        addressCache: {
-            size: addressCache.size,
-            hits: addressCacheHits,
-            misses: addressCacheMisses,
-            hitRate: addressCacheHits / (addressCacheHits + addressCacheMisses || 1)
-        },
-        reverseAddressCache: {
-            size: reverseAddressCache.size
-        },
-        balanceCache: {
-            size: balanceCache.size,
-            hits: balanceCacheHits,
-            misses: balanceCacheMisses,
-            hitRate: balanceCacheHits / (balanceCacheHits + balanceCacheMisses || 1)
+function generateStatisticsFile(wallets, votes, statsFile, minSeiRequired) {
+    try {
+        // Calculate statistics
+        const totalVotes = votes.size;
+        const validVotes = Array.from(votes.values()).filter(vote => vote.finalIsValid).length;
+        const totalWallets = wallets.size;
+        const walletsWithValidVotes = Array.from(wallets.values()).filter(wallet => 
+            wallet.finalBalanceValid && 
+            wallet.votes.some(txHash => {
+                const vote = votes.get(txHash);
+                return vote && vote.finalIsValid;
+            })
+        ).length;
+        
+        // Categorize wallets by vote count
+        const voteCountCategories = {
+            singleVote: 0,
+            twoToFiveVotes: 0,
+            sixToTenVotes: 0,
+            moreThanTenVotes: 0
+        };
+        
+        for (const wallet of wallets.values()) {
+            const voteCount = wallet.votes.length;
+            
+            if (voteCount === 1) {
+                voteCountCategories.singleVote++;
+            } else if (voteCount >= 2 && voteCount <= 5) {
+                voteCountCategories.twoToFiveVotes++;
+            } else if (voteCount >= 6 && voteCount <= 10) {
+                voteCountCategories.sixToTenVotes++;
+            } else if (voteCount > 10) {
+                voteCountCategories.moreThanTenVotes++;
+            }
         }
-    };
+        
+        // Categorize wallets by balance
+        const balanceCategories = {
+            lessThan100Sei: 0,
+            between100And500Sei: 0,
+            between500And1000Sei: 0,
+            moreThan1000Sei: 0
+        };
+        
+        for (const wallet of wallets.values()) {
+            const balance = wallet.finalBalance || 0;
+            
+            if (balance < 100) {
+                balanceCategories.lessThan100Sei++;
+            } else if (balance >= 100 && balance < 500) {
+                balanceCategories.between100And500Sei++;
+            } else if (balance >= 500 && balance < 1000) {
+                balanceCategories.between500And1000Sei++;
+            } else {
+                balanceCategories.moreThan1000Sei++;
+            }
+        }
+        
+        // Find top voters
+        const topVoters = Array.from(wallets.values())
+            .map(wallet => ({
+                address: wallet.evmAddress,
+                cosmosAddress: wallet.cosmosAddress,
+                voteCount: wallet.votes.length,
+                validVoteCount: wallet.votes.filter(txHash => {
+                    const vote = votes.get(txHash);
+                    return vote && vote.finalIsValid;
+                }).length,
+                totalVoted: wallet.votes.reduce((sum, txHash) => {
+                    const vote = votes.get(txHash);
+                    return sum + (vote ? (vote.voteAmount || vote.value || 0) : 0);
+                }, 0),
+                finalBalance: wallet.finalBalance || 0
+            }))
+            .sort((a, b) => b.voteCount - a.voteCount || b.totalVoted - a.totalVoted)
+            .slice(0, 10); // Top 10 voters
+        
+        // Create statistics object
+        const statistics = {
+            generatedAt: new Date().toISOString(),
+            overview: {
+                totalVotes,
+                validVotes,
+                validVotePercentage: (validVotes / totalVotes * 100).toFixed(2),
+                totalWallets,
+                walletsWithValidVotes,
+                validWalletPercentage: (walletsWithValidVotes / totalWallets * 100).toFixed(2),
+                minimumBalanceRequired: minSeiRequired
+            },
+            walletCategories: {
+                byVoteCount: voteCountCategories,
+                byBalanceRange: balanceCategories
+            },
+            topVoters
+        };
+        
+        // Write to file
+        fs.writeFileSync(statsFile, JSON.stringify(statistics, null, 2), 'utf8');
+        console.log(`Statistics file generated at: ${statsFile}`);
+        
+        return statistics;
+    } catch (error) {
+        console.error('Error generating statistics file:', error.message);
+        return null;
+    }
 }
 
-/**
- * Clear caches to free memory
- * @param {boolean} clearAddressCache Whether to clear address cache
- * @param {boolean} clearBalanceCache Whether to clear balance cache
- */
-export function clearCaches(clearAddressCache = false, clearBalanceCache = true) {
-    if (clearBalanceCache) {
-        console.log(`Clearing balance cache (${balanceCache.size} entries)`);
-        balanceCache.clear();
-    }
-    
-    if (clearAddressCache) {
-        console.log(`Clearing address cache (${addressCache.size} entries) and reverse cache (${reverseAddressCache.size} entries)`);
-        addressCache.clear();
-        reverseAddressCache.clear();
-    }
-}
-
-/**
- * Adaptive cache management based on memory pressure
- * @param {number} maxMemUsageMB Max memory usage in MB before aggressive clearing
- * @param {number} targetMemUsageMB Target memory usage in MB after clearing
- */
-export function adaptiveCacheManagement(maxMemUsageMB = 1024, targetMemUsageMB = 768) {
-    const memUsage = process.memoryUsage();
-    const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-    
-    console.log(`Current memory usage: ${heapUsedMB} MB`);
-    
-    if (heapUsedMB > maxMemUsageMB) {
-        console.log(`Memory usage (${heapUsedMB} MB) exceeds threshold (${maxMemUsageMB} MB). Clearing caches...`);
-        
-        // Clear balance cache first (usually largest)
-        clearCaches(false, true);
-        
-        // If still too high, clear address caches too
-        const newMemUsage = process.memoryUsage();
-        const newHeapUsedMB = Math.round(newMemUsage.heapUsed / 1024 / 1024);
-        
-        if (newHeapUsedMB > targetMemUsageMB) {
-            clearCaches(true, false);
-        }
-        
-        // Force garbage collection if available
-        if (global.gc) {
-            global.gc();
-            console.log('Garbage collection triggered');
-        }
-    }
-}
+// Export additional functions for memory management
+export { getCacheStats };
